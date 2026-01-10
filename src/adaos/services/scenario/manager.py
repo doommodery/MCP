@@ -1,6 +1,8 @@
+# src\adaos\services\scenario\manager.py
 from __future__ import annotations
 from dataclasses import dataclass
-import re, os
+import logging
+import re, os, json
 from pathlib import Path
 from typing import Optional, Literal
 
@@ -20,10 +22,11 @@ from adaos.services.node_config import load_config
 from adaos.services.scenarios.loader import read_manifest, read_content
 import y_py as Y
 from adaos.services.yjs.doc import get_ydoc, async_get_ydoc
-from adaos.apps.yjs.webspace import default_webspace_id
+from adaos.services.yjs.webspace import default_webspace_id
 from adaos.services.skill.manager import SkillManager
 
 _name_re = re.compile(r"^[a-zA-Z0-9_\-\/]+$")
+_log = logging.getLogger("adaos.scenario.manager")
 
 
 @dataclass(slots=True)
@@ -133,8 +136,22 @@ class ScenarioManager:
             pass
         return meta
 
-    def _ensure_yjs_payload(self, scenario_id: str) -> tuple[dict, dict, dict]:
-        content = read_content(scenario_id)
+    def _ensure_yjs_payload(self, scenario_id: str, *, space: str = "workspace") -> tuple[dict, dict, dict, dict]:
+        """
+        Load and normalise declarative payload from scenario.json so that it can
+        be projected into a webspace YDoc.
+
+        The returned tuple is:
+          - ui_section:    content["ui"]["application"]  (or {}),
+          - registry:      content["registry"]           (or {}),
+          - catalog:       content["catalog"]            (or {}),
+          - data_section:  content["data"]               (or {}).
+
+        This shape matches the target-state description in
+        docs/concepts/scenarios-target-state.md and is the only input for the
+        ScenarioManager.sync_to_yjs* projection helpers.
+        """
+        content = read_content(scenario_id, space=space)
         if not content:
             raise FileNotFoundError(f"scenario '{scenario_id}' has no scenario.json content")
         ui_section = ((content.get("ui") or {}).get("application")) or {}
@@ -146,9 +163,30 @@ class ScenarioManager:
         catalog_section = content.get("catalog") or {}
         if not isinstance(catalog_section, dict):
             catalog_section = {}
-        return ui_section, registry_section, catalog_section
+        data_section = content.get("data") or {}
+        if not isinstance(data_section, dict):
+            data_section = {}
 
-    def _project_to_doc(self, ydoc: Y.YDoc, scenario_id: str, ui_section: dict, registry_section: dict, catalog_section: dict) -> None:
+        # Debug trace to help diagnose scenario→YDoc projection issues without
+        # failing the projection if logging is misconfigured.
+        try:
+            desktop = (ui_section.get("desktop") or {}) if isinstance(ui_section, dict) else {}
+            topbar = desktop.get("topbar")
+            _log.debug("scenario '%s' ui.desktop.topbar=%s", scenario_id, topbar)
+        except Exception:
+            pass
+
+        return ui_section, registry_section, catalog_section, data_section
+
+    def _project_to_doc(
+        self,
+        ydoc: Y.YDoc,
+        scenario_id: str,
+        ui_section: dict,
+        registry_section: dict,
+        catalog_section: dict,
+        data_section: dict,
+    ) -> None:
         with ydoc.begin_transaction() as txn:
             ui_map = ydoc.get_map("ui")
             registry_map = ydoc.get_map("registry")
@@ -179,30 +217,51 @@ class ScenarioManager:
             data_updated[scenario_id] = entry
             data_map.set(txn, "scenarios", data_updated)
 
-    def sync_to_yjs(self, scenario_id: str, webspace_id: str | None = None) -> None:
+            # Optional root data overrides from scenario.json:
+            # if "data" section is present in the scenario payload, its
+            # top-level keys are projected into the webspace data map.
+            # This is used for initial data seeding (e.g. data.weather)
+            # and for YJS reload; only explicitly defined keys are
+            # overwritten.
+            if isinstance(data_section, dict):
+                for key, value in data_section.items():
+                    if not isinstance(key, str):
+                        continue
+                    try:
+                        payload = json.loads(json.dumps(value))
+                    except Exception:
+                        payload = value
+                    data_map.set(txn, key, payload)
+
+    def sync_to_yjs(self, scenario_id: str, webspace_id: str | None = None, *, space: str = "workspace") -> None:
         """
-        Project the declarative scenario payload into the webspace YDoc so
-        downstream services (Yjs/WS, web_desktop_skill, etc.) can pick it up.
+        Project the declarative scenario payload into the webspace YDoc.
+
+        This is the generic projection entry point described in the
+        scenario target-state docs: it takes scenario.json, writes
+        ui/data/registry sections into the YDoc, and emits a single
+        ``scenarios.synced`` event that Webspace Scenario Runtime and other
+        downstream services can react to.
         """
         target_webspace = webspace_id or default_webspace_id()
         self.caps.require("core", "scenarios.manage")
-        ui_section, registry_section, catalog_section = self._ensure_yjs_payload(scenario_id)
+        ui_section, registry_section, catalog_section, data_section = self._ensure_yjs_payload(scenario_id, space=space)
 
         with get_ydoc(target_webspace) as ydoc:
-            self._project_to_doc(ydoc, scenario_id, ui_section, registry_section, catalog_section)
+            self._project_to_doc(ydoc, scenario_id, ui_section, registry_section, catalog_section, data_section)
 
         emit(self.bus, "scenarios.synced", {"scenario_id": scenario_id, "webspace_id": target_webspace}, "scenario.mgr")
 
-    async def sync_to_yjs_async(self, scenario_id: str, webspace_id: str | None = None) -> None:
+    async def sync_to_yjs_async(self, scenario_id: str, webspace_id: str | None = None, *, space: str = "workspace") -> None:
         """
         Async variant of :meth:`sync_to_yjs` for use inside running event loops.
         """
         target_webspace = webspace_id or default_webspace_id()
         self.caps.require("core", "scenarios.manage")
-        ui_section, registry_section, catalog_section = self._ensure_yjs_payload(scenario_id)
+        ui_section, registry_section, catalog_section, data_section = self._ensure_yjs_payload(scenario_id, space=space)
 
         async with async_get_ydoc(target_webspace) as ydoc:
-            self._project_to_doc(ydoc, scenario_id, ui_section, registry_section, catalog_section)
+            self._project_to_doc(ydoc, scenario_id, ui_section, registry_section, catalog_section, data_section)
 
         emit(self.bus, "scenarios.synced", {"scenario_id": scenario_id, "webspace_id": target_webspace}, "scenario.mgr")
 
@@ -248,8 +307,11 @@ class ScenarioManager:
                 # Do not break scenario install on individual dependency issues.
                 continue
 
-    def remove(self, name: str) -> None:
+    def remove(self, name: str, *, safe: bool = False) -> None:
         self.caps.require("core", "scenarios.manage", "net.git")
+        name = name.strip()
+        if not _name_re.match(name):
+            raise ValueError("invalid scenario name")
         self.repo.ensure()
         self.reg.unregister(name)
         root = self.ctx.paths.workspace_dir()
@@ -262,7 +324,9 @@ class ScenarioManager:
         self.git.sparse_init(str(root), cone=False)
         if prefixed:
             self.git.sparse_set(str(root), prefixed, no_cone=True)
-        self.git.pull(str(root))
+        if safe:
+            # Безопасный режим: синхронизируем workspace с удалённым репо.
+            self.git.pull(str(root))
         remove_tree(
             str(root / "scenarios" / name),
             fs=self.paths.ctx.fs if hasattr(self.paths, "ctx") else get_ctx().fs,
@@ -332,6 +396,6 @@ class ScenarioManager:
         # ничего не мешает вернуть sha в result через setattr/обновлённый датакласс — но это опционально
         return result
 
-    def uninstall(self, name: str) -> None:
+    def uninstall(self, name: str, *, safe: bool = False) -> None:
         """Alias for :meth:`remove` to keep parity with :class:`SkillManager`."""
-        self.remove(name)
+        self.remove(name, safe=safe)

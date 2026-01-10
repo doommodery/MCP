@@ -5,7 +5,9 @@ import cors, { type CorsOptions } from 'cors'
 import https from 'https'
 import path from 'path'
 import type { IncomingMessage } from 'http'
+import { fetch } from 'undici'
 import { v4 as uuidv4 } from 'uuid'
+import AdmZip from 'adm-zip'
 import { Server, Socket } from 'socket.io'
 import { createClient } from 'redis'
 import fs from 'node:fs'
@@ -15,6 +17,7 @@ import type { PeerCertificate, TLSSocket } from 'node:tls'
 import { readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { installMetaRoutes } from './io/root/meta.js'
+import YAML from 'yaml'
 
 import { installAdaosBridge } from './adaos-bridge.js'
 import { CertificateAuthority } from './pki.js'
@@ -27,12 +30,9 @@ import {
 	type MessageParams,
 } from './i18n.js'
 import { NatsBus } from './io/bus/nats.js'
-import {
-	installWsNatsProxy,
-	installWsNatsProxyDebugRoute,
-} from './io/bus/wsNatsProxy.js'
+import { installWsNatsProxy } from './io/bus/wsNatsProxy.js'
 import { installTelegramWebhookRoutes } from './io/telegram/webhook.js'
-import { ensureSchema as ensureTgSchema } from './db/tg.repo.js'
+import { ensureSchema as ensureTgSchema, ensureHubToken } from './db/tg.repo.js'
 import { installPairingApi } from './io/pairing/api.js'
 import { buildInfo } from './build-info.js'
 import { installWebAuthnRoutes, storeDeviceCode } from './webauthn.js'
@@ -210,6 +210,10 @@ function requireEnv(name: string): string {
 const HOST = process.env['HOST'] ?? '0.0.0.0'
 const PORT = Number.parseInt(process.env['PORT'] ?? '3030', 10)
 const ROOT_TOKEN = process.env['ROOT_TOKEN'] ?? 'dev-root-token'
+const WEB_SESSION_JWT_SECRET =
+	(String(process.env['WEB_SESSION_JWT_SECRET'] ?? '').trim() ||
+		String(process.env['ROOT_TOKEN'] ?? '').trim() ||
+		ROOT_TOKEN)
 const CA_KEY_PEM = readPemFromEnvOrFile('CA_KEY_PEM', 'CA_KEY_PEM_FILE')
 const CA_CERT_PEM = readPemFromEnvOrFile('CA_CERT_PEM', 'CA_CERT_PEM_FILE')
 /* TODO
@@ -219,12 +223,53 @@ const TLS_CERT_PEM = readPemFromEnvOrFile('TLS_CERT_PEM', 'TLS_CERT_PEM_FILE');
 const TLS_KEY_PEM = normalizePem(process.env['TLS_KEY_PEM'] ?? CA_KEY_PEM)
 const TLS_CERT_PEM = normalizePem(process.env['TLS_CERT_PEM'] ?? CA_CERT_PEM)
 const FORGE_GIT_URL = requireEnv('FORGE_GIT_URL')
-const WEB_RP_ID = process.env['WEB_RP_ID'] ?? 'app.inimatic.com'
+// WebAuthn RP ID must be a registrable domain suffix of the current origin.
+// Using the apex domain keeps it valid across app subdomains (app., v1.app., etc).
+const WEB_RP_ID = process.env['WEB_RP_ID'] ?? 'inimatic.com'
 const WEB_ORIGIN = process.env['WEB_ORIGIN'] ?? 'https://app.inimatic.com'
-const WEB_SESSION_TTL_SECONDS = Number.parseInt(
-	process.env['WEB_SESSION_TTL_SECONDS'] ?? '3600',
-	10
-)
+
+function resolveNodeYamlPath(): string | null {
+	const explicit = (process.env['ADAOS_NODE_YAML_PATH'] || process.env['ADAOS_NODE_YAML'] || '').trim()
+	if (explicit) return explicit
+	// Try a few common dev layouts (repo root / container root).
+	const candidates = [
+		resolve(process.cwd(), '.adaos', 'node.yaml'),
+		resolve(process.cwd(), '..', '.adaos', 'node.yaml'),
+		resolve(process.cwd(), '..', '..', '.adaos', 'node.yaml'),
+		resolve(process.cwd(), '..', '..', '..', '.adaos', 'node.yaml'),
+		resolve(process.cwd(), '..', '..', '..', '..', '.adaos', 'node.yaml'),
+	]
+	for (const p of candidates) {
+		try {
+			if (fs.existsSync(p)) return p
+		} catch {}
+	}
+	return null
+}
+
+function resolveWebSessionTtlSeconds(): number {
+	// Highest priority: explicit env override
+	const envRaw = (process.env['WEB_SESSION_TTL_SECONDS'] || '').trim()
+	if (envRaw) {
+		const envVal = Number.parseInt(envRaw, 10)
+		if (Number.isFinite(envVal) && envVal > 0) return envVal
+	}
+	// Optional: node.yaml override (dev/self-hosted hubs)
+	const nodePath = resolveNodeYamlPath()
+	if (nodePath) {
+		try {
+			const raw = readFileSync(nodePath, 'utf8')
+			const cfg: any = YAML.parse(raw) || {}
+			const ttl = cfg?.auth?.web_session_ttl_seconds?.owner ?? cfg?.auth?.web_session_ttl_seconds?.default
+			const val = Number.parseInt(String(ttl ?? ''), 10)
+			if (Number.isFinite(val) && val > 0) return val
+		} catch {}
+	}
+	// Default: 1 hour
+	return 3600
+}
+
+const WEB_SESSION_TTL_SECONDS = resolveWebSessionTtlSeconds()
 const FORGE_SSH_KEY = process.env['FORGE_SSH_KEY']
 const FORGE_AUTHOR_NAME = process.env['FORGE_GIT_AUTHOR_NAME'] ?? 'AdaOS Root'
 const FORGE_AUTHOR_EMAIL =
@@ -267,6 +312,7 @@ function addAllowedCorsOrigin(candidate?: string | null) {
 
 addAllowedCorsOrigin(WEB_ORIGIN)
 addAllowedCorsOrigin('https://app.inimatic.com')
+addAllowedCorsOrigin('https://v1.app.inimatic.com')
 
 const extraCorsOrigins =
 	process.env['CORS_EXTRA_ORIGINS'] ?? process.env['CORS_ALLOWED_ORIGINS']
@@ -324,10 +370,27 @@ function withLeadingSlash(value: string, fallback: string): string {
 	return trimmed.startsWith('/') ? trimmed : `/${trimmed}`
 }
 
+function buildNatsWsUrl(): string {
+	const baseHttp = (process.env['TG_WEBHOOK_BASE'] || 'https://api.inimatic.com').replace(/\/+$/, '')
+	const baseUrl = new URL(baseHttp)
+	const wsProto = baseUrl.protocol.startsWith('http') ? baseUrl.protocol.replace('http', 'ws') : 'wss:'
+	baseUrl.protocol = wsProto
+	const base = baseUrl.toString().replace(/\/+$/, '')
+	const publicOverride = (process.env['NATS_WS_PUBLIC'] || '').trim()
+	if (publicOverride) return publicOverride
+	// Keep this in sync with the WS->NATS proxy mount (`WS_NATS_PATH`).
+	const wsPath = withLeadingSlash(process.env['WS_NATS_PATH'] || '/nats', '/nats')
+	return wsPath === '/' ? base : `${base}${wsPath}`
+}
+
 const SOCKET_PATH = withLeadingSlash(
 	process.env['SOCKET_PATH'] ?? '/socket.io',
 	'/socket.io'
 )
+if (SOCKET_PATH === '/') {
+	console.warn('[socket.io] SOCKET_PATH="/" would hijack all WS upgrades; forcing "/socket.io"')
+}
+const EFFECTIVE_SOCKET_PATH = SOCKET_PATH === '/' ? '/socket.io' : SOCKET_PATH
 const SOCKET_CHANNEL_NS = withLeadingSlash(
 	process.env['SOCKET_CHANNEL_NS'] ?? '/adaos',
 	'/adaos'
@@ -352,7 +415,7 @@ const io = new Server(server, {
 	cors: { origin: '*' },
 	pingTimeout: 10000,
 	pingInterval: 10000,
-	path: SOCKET_PATH,
+	path: EFFECTIVE_SOCKET_PATH,
 })
 
 type EngineAllowRequest = (
@@ -441,16 +504,26 @@ engineWithAllowRequest.allowRequest = (req, callback) => {
 		console.error('socket allowRequest error', error)
 		callback('Unauthorized', false)
 	}
-}
+	}
 
-installAdaosBridge(app, server)
+	installAdaosBridge(app, server)
 
-const redisUrl = `redis://${
-	process.env['PRODUCTION'] ? 'redis' : 'localhost'
-}:6379`
-const redisClient = await createClient({ url: redisUrl })
-	.on('error', (err) => console.error('Redis Client Error', err))
-	.connect()
+	function resolveRedisUrl(): string {
+		const explicit = (process.env['REDIS_URL'] || '').trim()
+		if (explicit) return explicit
+		const host =
+			(process.env['REDIS_HOST'] || '').trim() ||
+			(process.env['PRODUCTION'] ? 'redis' : 'localhost')
+		const port = Number.parseInt((process.env['REDIS_PORT'] || '').trim() || '6379', 10) || 6379
+		const db = (process.env['REDIS_DB'] || '').trim()
+		return `redis://${host}:${port}${db ? `/${encodeURIComponent(db)}` : ''}`
+	}
+
+	const redisUrl = resolveRedisUrl()
+	console.log(`[redis] connecting url=${redisUrl}`)
+	const redisClient = await createClient({ url: redisUrl })
+		.on('error', (err) => console.error('Redis Client Error', err))
+		.connect()
 
 const certificateAuthority = new CertificateAuthority({
 	certPem: CA_CERT_PEM,
@@ -473,6 +546,7 @@ installWebAuthnRoutes(
 		defaultSessionTtlSeconds: WEB_SESSION_TTL_SECONDS,
 		rpID: WEB_RP_ID,
 		origin: WEB_ORIGIN,
+		sessionJwtSecret: WEB_SESSION_JWT_SECRET,
 	},
 	respondError
 )
@@ -615,10 +689,10 @@ function parseTtl(ttl: unknown): number | undefined {
 		unit === 's'
 			? value
 			: unit === 'm'
-			? value * 60
-			: unit === 'h'
-			? value * 60 * 60
-			: value * 24 * 60 * 60
+				? value * 60
+				: unit === 'h'
+					? value * 60 * 60
+					: value * 24 * 60 * 60
 	return seconds / (24 * 60 * 60)
 }
 
@@ -773,6 +847,113 @@ app.get('/v1/health', (_req, res) => {
 		commit: buildInfo.commit,
 		time: new Date().toISOString(),
 	})
+})
+
+app.get('/v1/llm/models', async (_req, res) => {
+	const apiKey = (process.env['OPENAI_API_KEY'] ?? '').trim()
+	if (!apiKey) {
+		return res.status(503).json({ ok: false, error: 'openai_api_key_missing' })
+	}
+
+	try {
+		const r = await fetch('https://api.openai.com/v1/models', {
+			method: 'GET',
+			headers: {
+				authorization: `Bearer ${apiKey}`,
+			},
+		})
+
+		const text = await r.text()
+		let data: any = null
+		if (text) {
+			try {
+				data = JSON.parse(text)
+			} catch (e: any) {
+				console.warn('llm models upstream returned non-JSON payload', e)
+			}
+		}
+
+		if (!r.ok) {
+			return res
+				.status(r.status)
+				.json(data ?? { ok: false, error: 'llm_models_upstream_failed', status: r.status })
+		}
+
+		return res.json(data ?? { ok: true })
+	} catch (error: any) {
+		console.error('llm models proxy failed', error)
+		return res
+			.status(502)
+			.json({ ok: false, error: 'llm_models_proxy_failed', detail: String(error?.message ?? error) })
+	}
+})
+
+app.post('/v1/llm/response', async (req, res) => {
+	const apiKey = (process.env['OPENAI_API_KEY'] ?? '').trim()
+	if (!apiKey) {
+		return res.status(503).json({ ok: false, error: 'openai_api_key_missing' })
+	}
+
+	try {
+		const body = req.body ?? {}
+		const model =
+			(typeof body.model === 'string' && body.model.trim()) ||
+			(process.env['OPENAI_RESPONSES_MODEL'] ?? 'gpt-4o-mini')
+		const messages = Array.isArray(body.messages) ? body.messages : []
+
+		const input = messages.map((m: any) => ({
+			role: typeof m?.role === 'string' ? m.role : 'user',
+			content: [
+				{
+					type: 'input_text',
+					text: typeof m?.content === 'string' ? m.content : '',
+				},
+			],
+		}))
+
+		const openaiPayload: any = { model, input }
+		if (typeof body.temperature === 'number') {
+			openaiPayload.temperature = body.temperature
+		}
+		if (typeof body.max_tokens === 'number') {
+			openaiPayload.max_output_tokens = body.max_tokens
+		}
+		if (typeof body.top_p === 'number') {
+			openaiPayload.top_p = body.top_p
+		}
+
+		const r = await fetch('https://api.openai.com/v1/responses', {
+			method: 'POST',
+			headers: {
+				'content-type': 'application/json',
+				authorization: `Bearer ${apiKey}`,
+			},
+			body: JSON.stringify(openaiPayload),
+		})
+
+		const text = await r.text()
+		let data: any = null
+		if (text) {
+			try {
+				data = JSON.parse(text)
+			} catch (e: any) {
+				console.warn('llm upstream returned non-JSON payload', e)
+			}
+		}
+
+		if (!r.ok) {
+			return res
+				.status(r.status)
+				.json(data ?? { ok: false, error: 'llm_upstream_failed', status: r.status })
+		}
+
+		return res.json(data ?? { ok: true })
+	} catch (error: any) {
+		console.error('llm proxy failed', error)
+		return res
+			.status(502)
+			.json({ ok: false, error: 'llm_proxy_failed', detail: String(error?.message ?? error) })
+	}
 })
 
 // Prometheus metrics endpoint
@@ -1047,7 +1228,7 @@ app.use('/v1', rootRouter)
 // --- IO (Telegram) wiring ---
 try {
 	if (process.env['PG_URL']) await ensureTgSchema()
-} catch {}
+} catch { }
 let ioBus: NatsBus | null = null
 if (
 	(process.env['IO_BUS_KIND'] || 'local').toLowerCase() === 'nats' &&
@@ -1056,7 +1237,7 @@ if (
 	try {
 		ioBus = new NatsBus(process.env['NATS_URL']!)
 		await ioBus.connect()
-		console.log(`[io] NATS connected at ${process.env['NATS_URL']}`)
+		console.log(`[io] NATS connected`)
 		// subscribe to outbound for a single configured bot
 		const botId = process.env['BOT_ID'] || 'main-bot'
 		const { TelegramSender } = await import('./io/telegram/sender.js')
@@ -1071,7 +1252,7 @@ if (
 			} catch (e) {
 				try {
 					await ioBus!.publish_dlq('output', { error: String(e) })
-				} catch {}
+				} catch { }
 			}
 		})
 		// Backward compatibility: legacy hubs may publish to io.tg.out
@@ -1085,7 +1266,7 @@ if (
 			} catch (e) {
 				try {
 					await ioBus!.publish_dlq('output', { error: String(e) })
-				} catch {}
+				} catch { }
 			}
 		})
 		// Optional: debug taps (comma-separated subjects) e.g. IO_TAP_SUBJECTS="tg.input.>,tg.output.>,io.tg.out"
@@ -1143,16 +1324,31 @@ installTelegramWebhookRoutes(app, ioBus)
 installPairingApi(app)
 import('./io/bus/natsAuth.js')
 	.then((m) => m.installNatsAuth(app))
-	.catch(() => {})
-try {
-	installWsNatsProxyDebugRoute(app)
-} catch {}
+	.catch(() => { })
 
 // Install WS->NATS proxy for hubs (accepts NATS WS handshake, rewrites creds)
 try {
 	installWsNatsProxy(server)
 } catch (e) {
 	console.error('ws nats proxy init failed', e)
+}
+
+// Install Browser->Hub routing proxy (HTTP + WS) over NATS.
+// This is the "root proxy" fallback path; it keeps browsers on api.inimatic.com while hubs stay behind NAT.
+try {
+	if (process.env['NATS_URL']) {
+		const { installHubRouteProxy } = await import('./io/bus/hubRouteProxy.js')
+		installHubRouteProxy(app, server, {
+			redis: redisClient,
+			natsUrl: process.env['NATS_URL']!,
+			sessionJwtSecret: WEB_SESSION_JWT_SECRET,
+		})
+		console.log('[route] hub proxy installed')
+	} else {
+		console.warn('[route] NATS_URL missing; hub proxy disabled')
+	}
+} catch (e) {
+	console.error('[route] hub proxy init failed', e)
 }
 
 // Send a message to Telegram resolving hub_id -> chat_id/bot_id via pairing store
@@ -1559,97 +1755,261 @@ mtlsRouter.get('/policy', (_req, res) => {
 	res.json(POLICY_RESPONSE)
 })
 
+mtlsRouter.post('/hub/nats/token', async (req, res) => {
+	const identity = req.auth
+	if (!identity || identity.type !== 'hub') {
+		return respondError(req, res, 403, 'hub_certificate_required')
+	}
+	try {
+		if (process.env['PG_URL']) {
+			await ensureTgSchema()
+		}
+		const hubId = identity.subnetId
+		const token = await ensureHubToken(hubId)
+		const ws_url = buildNatsWsUrl()
+		const nats_user = `hub_${hubId}`
+		return res.json({
+			ok: true,
+			hub_id: hubId,
+			hub_nats_token: token,
+			nats_ws_url: ws_url,
+			nats_user,
+		})
+	} catch (error) {
+		return handleError(req, res, error, {
+			status: 500,
+			code: 'internal_error',
+		})
+	}
+})
+
 const createDraftHandler =
 	(kind: DraftKind): express.RequestHandler =>
-	async (req, res) => {
-		const identity = req.auth
-		if (!identity)
-			return respondError(req, res, 401, 'client_certificate_required')
+		async (req, res) => {
+			const identity = req.auth
+			if (!identity)
+				return respondError(req, res, 401, 'client_certificate_required')
 
-		// Разрешаем и node, и hub
-		const name = typeof req.body?.name === 'string' ? req.body.name : ''
-		const archiveB64 =
-			typeof req.body?.archive_b64 === 'string'
-				? req.body.archive_b64
-				: ''
-		const sha256 =
-			typeof req.body?.sha256 === 'string' ? req.body.sha256 : undefined
+			// Разрешаем и node, и hub
+			const name = typeof req.body?.name === 'string' ? req.body.name : ''
+			const archiveB64 =
+				typeof req.body?.archive_b64 === 'string'
+					? req.body.archive_b64
+					: ''
+			const sha256 =
+				typeof req.body?.sha256 === 'string' ? req.body.sha256 : undefined
 
-		if (!name || !archiveB64)
-			return respondError(req, res, 400, 'archive_fields_required')
+			if (!name || !archiveB64)
+				return respondError(req, res, 400, 'archive_fields_required')
 
-		// поддержка node_id в payload, если пуш идет "от хаба от имени ноды" (опционально)
-		const payloadNodeId =
-			typeof req.body?.node_id === 'string' ? req.body.node_id : ''
+			// поддержка node_id в payload, если пуш идет "от хаба от имени ноды" (опционально)
+			const payloadNodeId =
+				typeof req.body?.node_id === 'string' ? req.body.node_id : ''
 
-		// Определяем целевой контекст хранения
-		let subnetId: string
-		let nodeId: string
+			// Определяем целевой контекст хранения
+			let subnetId: string
+			let nodeId: string
 
-		if (identity.type === 'node') {
-			subnetId = identity.subnetId
-			nodeId = identity.nodeId
-			if (payloadNodeId && payloadNodeId !== nodeId) {
-				return respondError(req, res, 403, 'node_mismatch')
+			if (identity.type === 'node') {
+				subnetId = identity.subnetId
+				nodeId = identity.nodeId
+				if (payloadNodeId && payloadNodeId !== nodeId) {
+					return respondError(req, res, 403, 'node_mismatch')
+				}
+			} else if (identity.type === 'hub') {
+				subnetId = identity.subnetId
+				// режим «хаб пушит черновик на уровень подсети», без привязки к конкретной ноде:
+				nodeId = payloadNodeId || 'hub'
+			} else {
+				return respondError(req, res, 403, 'invalid_client_certificate')
 			}
-		} else if (identity.type === 'hub') {
-			subnetId = identity.subnetId
-			// режим «хаб пушит черновик на уровень подсети», без привязки к конкретной ноде:
-			nodeId = payloadNodeId || 'hub'
-		} else {
-			return respondError(req, res, 403, 'invalid_client_certificate')
-		}
 
-		// дальше как было: decode, check size, verify SHA, writeDraft
-		let archive: Buffer
-		try {
-			assertSafeName(name)
-			archive = decodeArchive(archiveB64)
-			if (!archive.length) throw new HttpError(400, 'archive_empty')
-			if (archive.length > MAX_ARCHIVE_BYTES)
-				return respondError(req, res, 413, 'archive_too_large')
-			verifySha256(archive, sha256)
-		} catch (error) {
-			return handleError(req, res, error, {
-				status: 400,
-				code: 'invalid_archive',
-			})
-		}
+			// дальше как было: decode, check size, verify SHA, writeDraft
+			let archive: Buffer
+			try {
+				assertSafeName(name)
+				archive = decodeArchive(archiveB64)
+				if (!archive.length) throw new HttpError(400, 'archive_empty')
+				if (archive.length > MAX_ARCHIVE_BYTES)
+					return respondError(req, res, 413, 'archive_too_large')
+				verifySha256(archive, sha256)
+			} catch (error) {
+				return handleError(req, res, error, {
+					status: 400,
+					code: 'invalid_archive',
+				})
+			}
 
-		const started = Date.now()
-		try {
-			const result = await forgeManager.writeDraft({
-				kind,
-				subnetId,
-				nodeId,
-				name,
-				archive,
-			})
-			const keyPrefix =
-				kind === 'skills'
-					? SKILL_FORGE_KEY_PREFIX
-					: SCENARIO_FORGE_KEY_PREFIX
-			await redisClient.set(
-				`${keyPrefix}:${subnetId}:${nodeId}:${name}`,
-				JSON.stringify({
+			const started = Date.now()
+			try {
+				const result = await forgeManager.writeDraft({
+					kind,
+					subnetId,
+					nodeId,
+					name,
+					archive,
+				})
+				const keyPrefix =
+					kind === 'skills'
+						? SKILL_FORGE_KEY_PREFIX
+						: SCENARIO_FORGE_KEY_PREFIX
+				await redisClient.set(
+					`${keyPrefix}:${subnetId}:${nodeId}:${name}`,
+					JSON.stringify({
+						stored_path: result.storedPath,
+						commit: result.commitSha,
+						sha256: sha256 ?? null,
+						ts: Date.now(),
+					})
+				)
+				res.json({
+					ok: true,
 					stored_path: result.storedPath,
 					commit: result.commitSha,
-					ts: Date.now(),
+					sha256: sha256 ?? null,
 				})
-			)
-			res.json({
-				ok: true,
-				stored_path: result.storedPath,
-				commit: result.commitSha,
-			})
-		} catch (error) {
-			console.error('failed to store draft', error)
-			handleError(req, res, error, {
-				status: 500,
-				code: 'draft_store_failed',
-			})
+			} catch (error) {
+				console.error('failed to store draft', error)
+				handleError(req, res, error, {
+					status: 500,
+					code: 'draft_store_failed',
+				})
+			}
 		}
-	}
+
+const getDraftMetaHandler =
+	(kind: DraftKind): express.RequestHandler =>
+		async (req, res) => {
+			const identity = req.auth
+			if (!identity)
+				return respondError(req, res, 401, 'client_certificate_required')
+
+			const name = qstr(req.query, 'name')
+			const payloadNodeId = qstr(req.query, 'node_id')
+			if (!name) return respondError(req, res, 400, 'missing_params')
+			try {
+				assertSafeName(name)
+			} catch {
+				return respondError(req, res, 400, 'invalid_name')
+			}
+
+			let subnetId: string
+			let nodeId: string
+
+			if (identity.type === 'node') {
+				subnetId = identity.subnetId
+				nodeId = identity.nodeId
+				if (payloadNodeId && payloadNodeId !== nodeId) {
+					return respondError(req, res, 403, 'node_mismatch')
+				}
+			} else if (identity.type === 'hub') {
+				subnetId = identity.subnetId
+				nodeId = payloadNodeId || 'hub'
+			} else {
+				return respondError(req, res, 403, 'invalid_client_certificate')
+			}
+
+			const keyPrefix =
+				kind === 'skills' ? SKILL_FORGE_KEY_PREFIX : SCENARIO_FORGE_KEY_PREFIX
+			const key = `${keyPrefix}:${subnetId}:${nodeId}:${name}`
+			try {
+				const raw = await redisClient.get(key)
+				if (!raw) return respondError(req, res, 404, 'not_found')
+				let parsed: any = {}
+				try {
+					parsed = JSON.parse(raw)
+				} catch {
+					parsed = {}
+				}
+				return res.json({
+					ok: true,
+					name,
+					subnet_id: subnetId,
+					node_id: nodeId,
+					stored_path: parsed?.stored_path ?? null,
+					commit: parsed?.commit ?? null,
+					sha256: parsed?.sha256 ?? null,
+					ts: parsed?.ts ?? null,
+				})
+			} catch (error) {
+				return handleError(req, res, error, {
+					status: 500,
+					code: 'draft_meta_failed',
+				})
+			}
+		}
+
+const getDraftArchiveHandler =
+	(kind: DraftKind): express.RequestHandler =>
+		async (req, res) => {
+			const identity = req.auth
+			if (!identity)
+				return respondError(req, res, 401, 'client_certificate_required')
+
+			const name = qstr(req.query, 'name')
+			const payloadNodeId = qstr(req.query, 'node_id')
+			if (!name) return respondError(req, res, 400, 'missing_params')
+			try {
+				assertSafeName(name)
+			} catch {
+				return respondError(req, res, 400, 'invalid_name')
+			}
+
+			let subnetId: string
+			let nodeId: string
+
+			if (identity.type === 'node') {
+				subnetId = identity.subnetId
+				nodeId = identity.nodeId
+				if (payloadNodeId && payloadNodeId !== nodeId) {
+					return respondError(req, res, 403, 'node_mismatch')
+				}
+			} else if (identity.type === 'hub') {
+				subnetId = identity.subnetId
+				nodeId = payloadNodeId || 'hub'
+			} else {
+				return respondError(req, res, 403, 'invalid_client_certificate')
+			}
+
+			const keyPrefix =
+				kind === 'skills' ? SKILL_FORGE_KEY_PREFIX : SCENARIO_FORGE_KEY_PREFIX
+			const key = `${keyPrefix}:${subnetId}:${nodeId}:${name}`
+			try {
+				const raw = await redisClient.get(key)
+				if (!raw) return respondError(req, res, 404, 'not_found')
+				let parsed: any = {}
+				try {
+					parsed = JSON.parse(raw)
+				} catch {
+					parsed = {}
+				}
+				const storedPath =
+					typeof parsed?.stored_path === 'string' ? parsed.stored_path : ''
+				if (!storedPath) return respondError(req, res, 404, 'not_found')
+				const abs = path.resolve(forgeManagerWorkdir(), storedPath)
+				if (!fs.existsSync(abs)) return respondError(req, res, 404, 'not_found')
+				const zip = new AdmZip()
+				zip.addLocalFolder(abs)
+				const buffer = zip.toBuffer()
+				const b64 = buffer.toString('base64')
+				return res.json({
+					ok: true,
+					name,
+					archive_b64: b64,
+					sha256: parsed?.sha256 ?? null,
+				})
+			} catch (error) {
+				return handleError(req, res, error, {
+					status: 500,
+					code: 'draft_archive_failed',
+				})
+			}
+		}
+
+function forgeManagerWorkdir(): string {
+	// Keep in sync with ForgeManager initialization above.
+	return FORGE_WORKDIR || '/var/lib/adaos/forge'
+}
 
 const qstr = (q: any, key: string): string =>
 	typeof q?.[key] === 'string' ? q[key] : ''
@@ -1660,174 +2020,180 @@ const qbool = (q: any, key: string): boolean => {
 
 const deleteDraftHandler =
 	(kind: DraftKind): express.RequestHandler =>
-	async (req, res) => {
-		const identity = req.auth
-		if (!identity)
-			return respondError(req, res, 401, 'client_certificate_required')
+		async (req, res) => {
+			const identity = req.auth
+			if (!identity)
+				return respondError(req, res, 401, 'client_certificate_required')
 
-		const name = qstr(req.query, 'name')
-		const payloadNodeId = qstr(req.query, 'node_id')
-		const allNodes = qbool(req.query, 'all_nodes')
-		if (!name) return respondError(req, res, 400, 'missing_params')
+			const name = qstr(req.query, 'name')
+			const payloadNodeId = qstr(req.query, 'node_id')
+			const allNodes = qbool(req.query, 'all_nodes')
+			if (!name) return respondError(req, res, 400, 'missing_params')
 
-		try {
-			assertSafeName(name)
-		} catch {
-			return respondError(req, res, 400, 'invalid_name')
-		}
-
-		let subnetId: string
-		let nodeId: string | undefined
-
-		if (identity.type === 'node') {
-			subnetId = identity.subnetId
-			nodeId = identity.nodeId
-			if ((payloadNodeId && payloadNodeId !== nodeId) || allNodes) {
-				return respondError(req, res, 403, 'node_mismatch')
-			}
-		} else if (identity.type === 'hub') {
-			subnetId = identity.subnetId
-			nodeId = payloadNodeId || undefined
-		} else {
-			return respondError(req, res, 403, 'invalid_client_certificate')
-		}
-
-		const started = Date.now()
-		try {
-			const result = await forgeManager.deleteDraft({
-				kind,
-				subnetId,
-				name,
-				nodeId,
-				allNodes,
-			})
-
-			const keyPrefix =
-				kind === 'skills'
-					? SKILL_FORGE_KEY_PREFIX
-					: SCENARIO_FORGE_KEY_PREFIX
-			const keysToDelete = result.redisKeys ?? []
-			if (keysToDelete.length) {
-				await redisClient.del(keysToDelete)
-			}
-
-			console.info('draft deleted', {
-				action: 'delete_draft',
-				kind,
-				subnetId,
-				nodeId,
-				name,
-				allNodes,
-				duration_ms: Date.now() - started,
-				auditId: result.auditId,
-				deleted: result.deleted,
-			})
-
-			if (!result.deleted.length) {
-				return res.status(204).end()
-			}
-
-			return res.json({
-				ok: true,
-				deleted: result.deleted,
-				audit_id: result.auditId,
-			})
-		} catch (error: any) {
-			if (error?.code === 'not_found') {
-				return respondError(req, res, 404, 'not_found')
-			}
-			if (error?.code === 'invalid_name') {
+			try {
+				assertSafeName(name)
+			} catch {
 				return respondError(req, res, 400, 'invalid_name')
 			}
-			console.error('failed to delete draft', error)
-			return handleError(req, res, error, {
-				status: 500,
-				code: 'draft_delete_failed',
-			})
-		}
-	}
 
-const deleteRegistryHandler =
-	(kind: DraftKind): express.RequestHandler =>
-	async (req, res) => {
-		const identity = req.auth
-		if (!identity)
-			return respondError(req, res, 401, 'client_certificate_required')
+			let subnetId: string
+			let nodeId: string | undefined
 
-		const name = qstr(req.query, 'name')
-		const version = qstr(req.query, 'version') || undefined
-		const allVersions = qbool(req.query, 'all_versions')
-		const force = qbool(req.query, 'force')
+			if (identity.type === 'node') {
+				subnetId = identity.subnetId
+				nodeId = identity.nodeId
+				if ((payloadNodeId && payloadNodeId !== nodeId) || allNodes) {
+					return respondError(req, res, 403, 'node_mismatch')
+				}
+			} else if (identity.type === 'hub') {
+				subnetId = identity.subnetId
+				nodeId = payloadNodeId || undefined
+			} else {
+				return respondError(req, res, 403, 'invalid_client_certificate')
+			}
 
-		if (!name) return respondError(req, res, 400, 'missing_params')
-		if (!version && !allVersions)
-			return respondError(req, res, 400, 'missing_params')
+			const started = Date.now()
+			try {
+				const result = await forgeManager.deleteDraft({
+					kind,
+					subnetId,
+					name,
+					nodeId,
+					allNodes,
+				})
 
-		try {
-			assertSafeName(name)
-			if (version) assertSafeName(version)
-		} catch {
-			return respondError(req, res, 400, 'invalid_name')
-		}
+				const keyPrefix =
+					kind === 'skills'
+						? SKILL_FORGE_KEY_PREFIX
+						: SCENARIO_FORGE_KEY_PREFIX
+				const keysToDelete = result.redisKeys ?? []
+				if (keysToDelete.length) {
+					await redisClient.del(keysToDelete)
+				}
 
-		const subnetId = identity.subnetId
+				console.info('draft deleted', {
+					action: 'delete_draft',
+					kind,
+					subnetId,
+					nodeId,
+					name,
+					allNodes,
+					duration_ms: Date.now() - started,
+					auditId: result.auditId,
+					deleted: result.deleted,
+				})
 
-		const started = Date.now()
-		try {
-			const result = await forgeManager.deleteRegistry({
-				kind,
-				subnetId,
-				name,
-				version,
-				allVersions,
-				force,
-			})
+				if (!result.deleted.length) {
+					return res.status(204).end()
+				}
 
-			console.info('registry artifact deleted', {
-				action: 'delete_registry',
-				kind,
-				subnetId,
-				name,
-				version,
-				allVersions,
-				force,
-				duration_ms: Date.now() - started,
-				auditId: result.auditId,
-				deleted: result.deleted,
-				skipped: result.skipped ?? [],
-				tombstoned: !!result.tombstoned,
-			})
-
-			if (result.deleted?.length) {
 				return res.json({
 					ok: true,
 					deleted: result.deleted,
-					skipped: result.skipped ?? [],
 					audit_id: result.auditId,
-					tombstoned: !!result.tombstoned,
 				})
+			} catch (error: any) {
+				if (error?.code === 'not_found') {
+					return respondError(req, res, 404, 'not_found')
+				}
+				if (error?.code === 'invalid_name') {
+					return respondError(req, res, 400, 'invalid_name')
+				}
+				console.error('failed to delete draft', error)
+				return handleError(req, res, error, {
+					status: 500,
+					code: 'draft_delete_failed',
+				})
+			}
+		}
+
+const deleteRegistryHandler =
+	(kind: DraftKind): express.RequestHandler =>
+		async (req, res) => {
+			const identity = req.auth
+			if (!identity)
+				return respondError(req, res, 401, 'client_certificate_required')
+
+			const name = qstr(req.query, 'name')
+			const version = qstr(req.query, 'version') || undefined
+			const allVersions = qbool(req.query, 'all_versions')
+			const force = qbool(req.query, 'force')
+
+			if (!name) return respondError(req, res, 400, 'missing_params')
+			if (!version && !allVersions)
+				return respondError(req, res, 400, 'missing_params')
+
+			try {
+				assertSafeName(name)
+				if (version) assertSafeName(version)
+			} catch {
+				return respondError(req, res, 400, 'invalid_name')
 			}
 
-			return res.status(204).end()
-		} catch (error: any) {
-			if (error?.code === 'not_found') {
-				return respondError(req, res, 404, 'not_found')
-			}
-			if (error?.code === 'in_use') {
-				return respondError(req, res, 409, 'in_use', {
-					refs: error.refs || [],
+			const subnetId = identity.subnetId
+
+			const started = Date.now()
+			try {
+				const result = await forgeManager.deleteRegistry({
+					kind,
+					subnetId,
+					name,
+					version,
+					allVersions,
+					force,
+				})
+
+				console.info('registry artifact deleted', {
+					action: 'delete_registry',
+					kind,
+					subnetId,
+					name,
+					version,
+					allVersions,
+					force,
+					duration_ms: Date.now() - started,
+					auditId: result.auditId,
+					deleted: result.deleted,
+					skipped: result.skipped ?? [],
+					tombstoned: !!result.tombstoned,
+				})
+
+				if (result.deleted?.length) {
+					return res.json({
+						ok: true,
+						deleted: result.deleted,
+						skipped: result.skipped ?? [],
+						audit_id: result.auditId,
+						tombstoned: !!result.tombstoned,
+					})
+				}
+
+				return res.status(204).end()
+			} catch (error: any) {
+				if (error?.code === 'not_found') {
+					return respondError(req, res, 404, 'not_found')
+				}
+				if (error?.code === 'in_use') {
+					return respondError(req, res, 409, 'in_use', {
+						refs: error.refs || [],
+					})
+				}
+				console.error('failed to delete registry artifact', error)
+				return handleError(req, res, error, {
+					status: 500,
+					code: 'registry_delete_failed',
 				})
 			}
-			console.error('failed to delete registry artifact', error)
-			return handleError(req, res, error, {
-				status: 500,
-				code: 'registry_delete_failed',
-			})
 		}
-	}
 
 mtlsRouter.post('/skills/draft', createDraftHandler('skills'))
 mtlsRouter.post('/scenarios/draft', createDraftHandler('scenarios'))
+
+mtlsRouter.get('/skills/draft', getDraftMetaHandler('skills'))
+mtlsRouter.get('/scenarios/draft', getDraftMetaHandler('scenarios'))
+
+mtlsRouter.get('/skills/draft/archive', getDraftArchiveHandler('skills'))
+mtlsRouter.get('/scenarios/draft/archive', getDraftArchiveHandler('scenarios'))
 
 mtlsRouter.delete('/skills/draft', deleteDraftHandler('skills'))
 mtlsRouter.delete('/scenarios/draft', deleteDraftHandler('scenarios'))
@@ -1917,10 +2283,10 @@ function saveFileChunk(
 			openedStreams[sessionId][safeFile].stream.destroy()
 			fs.unlink(
 				FILESPATH +
-					openedStreams[sessionId][safeFile].timestamp +
-					'_' +
-					safeFile,
-				() => {}
+				openedStreams[sessionId][safeFile].timestamp +
+				'_' +
+				safeFile,
+				() => { }
 			)
 			delete openedStreams[sessionId][safeFile]
 			cleanupSessionBucket(sessionId)
@@ -1939,9 +2305,9 @@ function saveFileChunk(
 		openedStreams[sessionId][safeFile].stream.destroy()
 		fs.unlink(
 			FILESPATH +
-				openedStreams[sessionId][safeFile].timestamp +
-				'_' +
-				safeFile,
+			openedStreams[sessionId][safeFile].timestamp +
+			'_' +
+			safeFile,
 			(error) => {
 				if (error) console.log(error)
 			}

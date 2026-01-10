@@ -21,6 +21,7 @@ from adaos.services.registry.subnet_directory import get_directory
 from adaos.services.agent_context import get_ctx as _get_ctx
 from adaos.services.io_console import print_text
 from adaos.services.capacity import install_io_in_capacity, get_local_capacity, _load_node_yaml as _load_node, _save_node_yaml as _save_node
+from adaos.domain import Event as DomainEvent
 
 init_ctx()
 
@@ -30,9 +31,9 @@ async def lifespan(app: FastAPI):
     # 1) инициализируем AgentContext (публикуется через set_ctx внутри bootstrap_app)
 
     # 2) только теперь импортируем то, что может косвенно дернуть контекст
-    from adaos.apps.api import tool_bridge, subnet_api, observe_api, node_api, scenarios, root_endpoints, skills
+    from adaos.apps.api import tool_bridge, subnet_api, observe_api, node_api, scenarios, root_endpoints, skills, stt_api
     from adaos.apps.api import io_webhooks
-    from adaos.apps.yjs.y_gateway import router as y_router, start_y_server
+    from adaos.services.yjs.gateway import router as y_router, start_y_server, stop_y_server
 
     # 3) монтируем роутеры после bootstrap
     app.include_router(tool_bridge.router, prefix="/api")
@@ -41,6 +42,7 @@ async def lifespan(app: FastAPI):
     app.include_router(observe_api.router, prefix="/api/observe")
     app.include_router(scenarios.router, prefix="/api/scenarios")
     app.include_router(skills.router, prefix="/api/skills")
+    app.include_router(stt_api.router, prefix="/api")
     app.include_router(root_endpoints.router)
     # Chat IO webhooks (mounted without /api prefix to keep exact paths)
     app.include_router(io_webhooks.router)
@@ -67,11 +69,12 @@ async def lifespan(app: FastAPI):
         await start_y_server()
     except Exception:
         pass
-    await run_boot_sequence(app)
+    # Start router early so ui.notify/ui.say from boot sequence are routed.
     try:
         await router_service.start()
     except Exception:
         pass
+    await run_boot_sequence(app)
     # hub: seed self node into directory (base_url + capacity)
     try:
         conf = get_ctx().config
@@ -181,11 +184,12 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await stop_observer()
+        # Stop ypy-websocket background server so it does not keep the process alive.
         try:
-            await router_service.stop()
+            await stop_y_server()
         except Exception:
             pass
-        # On graceful shutdown, notify Telegram if it was enabled
+        # On graceful shutdown, notify Telegram and UI if enabled
         try:
             if tg_enabled:
                 conf = get_ctx().config
@@ -205,11 +209,43 @@ async def lifespan(app: FastAPI):
                     node_yaml = {}
                 alias = ((node_yaml.get("nats") or {}).get("alias")) or getattr(get_ctx().settings, "default_hub", None) or conf.subnet_id
                 prefixed_text = f"[{alias}]: {text}" if alias else text
-                _requests.post(
-                    f"{api_base.rstrip('/')}/io/tg/send",
-                    json={"hub_id": conf.subnet_id, "text": prefixed_text},
-                    timeout=2.5,
-                )
+                # Try routed notify first if router is running.
+                routed = False
+                try:
+                    if getattr(router_service, "_started", False):
+                        ctx.bus.publish(
+                            DomainEvent(
+                                type="ui.notify",
+                                payload={"text": prefixed_text},
+                                source="api",
+                                ts=time.time(),
+                            )
+                        )
+                        routed = True
+                except Exception:
+                    routed = False
+                if not routed:
+                    _requests.post(
+                        f"{api_base.rstrip('/')}/io/tg/send",
+                        json={"hub_id": conf.subnet_id, "text": prefixed_text},
+                        timeout=2.5,
+                    )
+                # Also emit a subnet.stopped event on the local bus so that
+                # skills (e.g. greet_on_boot_skill) can update infra status.
+                try:
+                    ev = DomainEvent(
+                        type="subnet.stopped",
+                        payload={"subnet_id": conf.subnet_id},
+                        source="api",
+                        ts=time.time(),
+                    )
+                    ctx.bus.publish(ev)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            await router_service.stop()
         except Exception:
             pass
         try:
@@ -293,6 +329,36 @@ async def status():
             "version": BUILD_INFO.version,
             "build_date": BUILD_INFO.build_date,
         },
+    }
+
+
+class YjsReloadRequest(BaseModel):
+    webspace_id: str | None = Field(default=None, description="Target webspace id; defaults to 'default'")
+
+
+@app.post("/api/yjs/reload", dependencies=[Depends(require_token)])
+async def yjs_reload(body: YjsReloadRequest) -> dict:
+    """
+    Soft reload of Yjs state for a given webspace.
+
+    For now this is implemented by recomputing the effective UI model via
+    WebspaceScenarioRuntime for the target webspace. It does not drop the
+    underlying YStore data; web clients can choose to clear their local
+    cache if needed.
+    """
+    webspace_id = body.webspace_id or "default"
+    try:
+        # Ensure webspace exists and has YDoc/YStore backing files.
+        # Detailed rebuild of ui/application and catalog is handled by
+        # WebspaceScenarioRuntime on events (scenarios.synced, skills.activated,
+        # desktop.webspace.reload, desktop.scenario.set). Here we only trigger
+        # low-level Yjs bootstrap so that clients can reconnect safely.
+        await ensure_webspace_ready(webspace_id)
+    except Exception as exc:  # pragma: no cover - defensive guard
+        raise HTTPException(status_code=500, detail=f"yjs_reload failed: {exc}") from exc
+    return {
+        "ok": True,
+        "webspace_id": webspace_id,
     }
 
 

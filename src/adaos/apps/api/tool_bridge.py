@@ -2,7 +2,7 @@
 from fastapi import APIRouter, HTTPException, Depends, Request, Response
 from pydantic import BaseModel, Field
 from typing import Any, Dict
-import requests
+import requests, os
 
 from adaos.apps.api.auth import require_token
 from adaos.services.observe import attach_http_trace_headers
@@ -12,6 +12,7 @@ from adaos.services.skill.manager import SkillManager
 from adaos.adapters.db import SqliteSkillRegistry
 from adaos.services.registry.subnet_directory import get_directory
 from adaos.services.agent_context import get_ctx
+from adaos.skills.runtime_runner import execute_tool
 
 
 router = APIRouter()
@@ -72,13 +73,16 @@ async def call_tool(body: ToolCall, request: Request, response: Response, ctx: A
             # На member нет прокси — вернём исходную ошибку
             raise HTTPException(status_code=404, detail=str(e))
 
-        # Найти online-ноду с этим skill
+        # Найти online-ноду с этим skill (используем только runtime; workspace-fallback отключён)
         directory = get_directory()
         candidates = directory.find_nodes_with_skill(skill_name, require_online=True)
         # Сначала активные, затем по last_seen убыв.
         candidates.sort(key=lambda n: (not bool(n.get("active"))), reverse=False)
         if not candidates:
-            raise HTTPException(status_code=503, detail=f"skill '{skill_name}' is not available online in the subnet")
+            raise HTTPException(
+                status_code=503,
+                detail=f"skill '{skill_name}', tool '{public_tool}' is not available online in the subnet. In dev: {body.dev}. Candidates: {candidates}. Err: {str(e)}",
+            )
         target = candidates[0]
         base_url = target.get("base_url") or directory.get_node_base_url(target.get("node_id", ""))
         if not base_url:

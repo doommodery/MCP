@@ -9,7 +9,7 @@ import typer
 
 from adaos.apps.cli.i18n import _
 from adaos.apps.cli.commands.skill import _mgr
-from adaos.apps.yjs.webspace import default_webspace_id
+from adaos.services.yjs.webspace import default_webspace_id
 from adaos.services.agent_context import get_ctx
 from adaos.services.node_config import displayable_path
 from adaos.services.root.service import (
@@ -18,6 +18,7 @@ from adaos.services.root.service import (
     ArtifactListItem,
     ArtifactNotFoundError,
     ArtifactPublishResult,
+    ArtifactUpdateResult,
     RootDeveloperService,
     RootInitResult,
     RootLoginResult,
@@ -148,6 +149,26 @@ def _echo_publish_result(kind_label: str, result: ArtifactPublishResult) -> None
             typer.echo(f"  - {warning}")
 
 
+def _echo_update_result(kind_label: str, result: ArtifactUpdateResult, json_output: bool) -> None:
+    if json_output:
+        payload = {
+            "name": result.name,
+            "source": _display_path(result.source_path),
+            "target": _display_path(result.target_path),
+            "version": result.version,
+            "updated_at": result.updated_at,
+        }
+        typer.echo(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+    typer.secho(f"{kind_label} '{result.name}' updated from Root Forge.", fg=typer.colors.GREEN)
+    typer.echo(f"Source: {_display_path(result.source_path)}")
+    typer.echo(f"Target: {_display_path(result.target_path)}")
+    if result.version:
+        typer.echo(f"Version: {result.version}")
+    if result.updated_at:
+        typer.echo(f"Updated at: {result.updated_at}")
+
+
 @root_app.command("init")
 def root_init(
     token: str = typer.Option(
@@ -218,24 +239,42 @@ def dev_login(
 ):
     ctx = get_ctx()
 
-    client = RootHttpClient.from_settings(
-        ctx.settings,
-    )
-    base = ctx.settings.api_base
+    # Build Root client using node.yaml mTLS materials (hub cert/key + CA),
+    # because Settings may not include PKI fields.
+    try:
+        from adaos.services.node_config import load_config, _expand_path as _expand_path
+
+        cfg = load_config(ctx=ctx)
+        ca = _expand_path(cfg.root_settings.ca_cert, "keys/ca.cert")
+        cert = _expand_path(cfg.subnet_settings.hub.cert, "keys/hub_cert.pem")
+        key = _expand_path(cfg.subnet_settings.hub.key, "keys/hub_private.pem")
+        verify = True
+        # Keep system CA by default; allow pinning via ADAOS_ROOT_VERIFY_CA=1.
+        if os.getenv("ADAOS_ROOT_VERIFY_CA", "0") == "1":
+            verify = str(ca) if ca.exists() else True
+        cert_tuple = (str(cert), str(key)) if cert.exists() and key.exists() else None
+        base = cfg.root_settings.base_url or ctx.settings.api_base
+        client = RootHttpClient(base_url=base, verify=verify, cert=cert_tuple)
+    except Exception:
+        base = ctx.settings.api_base
+        client = RootHttpClient(base_url=base)
     # Prefer explicit CLI option; otherwise always use canonical subnet_id for pairing,
     # because backend stores WS tokens keyed by canonical hub id (not alias).
-    hub_id = hub or ctx.settings.subnet_id or ctx.settings.default_hub or ctx.settings.owner_id
+    try:
+        hub_id = hub or (cfg.subnet_id if "cfg" in locals() and cfg else None) or ctx.settings.subnet_id or ctx.settings.default_hub or ctx.settings.owner_id
+    except Exception:
+        hub_id = hub or ctx.settings.subnet_id or ctx.settings.default_hub or ctx.settings.owner_id
     if status:
-        data = client.request("GET", f"{base}/io/tg/pair/status", params={"code": status})
+        data = client.request("GET", "/io/tg/pair/status", params={"code": status})
         typer.echo(data)
         raise typer.Exit(0)
     if revoke:
-        data = client.request("GET", f"{base}/io/tg/pair/revoke", params={"code": revoke})
+        data = client.request("POST", "/io/tg/pair/revoke", params={"code": revoke})
         typer.echo(data)
         raise typer.Exit(0)
     print("hub_log", hub_id)
     # Send hub id in JSON body using the expected key; avoid query param 'hub_id' which backend ignores
-    data = client.request("POST", f"{base}/io/tg/pair/create", json={"code": "PING", "hub_id": hub_id})
+    data = client.request("POST", "/io/tg/pair/create", json={"code": "PING", "hub_id": hub_id})
     # TODO Перенести обработку ошибок из метода _request на уровень  логики.
     """ if resp.status_code != 200:
         _print_error(f"API error: {resp.status_code} {resp.text}")
@@ -244,7 +283,7 @@ def dev_login(
     if not code:
         _print_error("No pair_code in response.")
         raise typer.Exit(1)
-    deep_link = data.get("deep_link") or f"https://t.me/adaos_bot?start={code}"
+    deep_link = data.get("deep_link") or f"https://t.me/adaos_home_bot?start={code}"
     typer.secho("Telegram pairing:", fg=typer.colors.GREEN)
     typer.echo(f"  pair_code: {code}")
     typer.echo(f"  deep_link: {deep_link}")
@@ -257,6 +296,16 @@ def dev_login(
     # Always use local canonical hub id for WS user to avoid alias-based mismatches
     local_hub_id = ctx.settings.subnet_id or hub_id_resp
     nats_user = (f"hub_{local_hub_id}" if local_hub_id else None) or data.get("nats_user") or (f"hub_{hub_id_resp}" if hub_id_resp else None)
+    if not hub_token:
+        try:
+            token_data = client.request("POST", "/v1/hub/nats/token")
+            if isinstance(token_data, dict):
+                hub_token = token_data.get("hub_nats_token") or hub_token
+                hub_id_resp = token_data.get("hub_id") or hub_id_resp
+                if not nats_user:
+                    nats_user = token_data.get("nats_user") or nats_user
+        except Exception:
+            pass
     # Pin to dedicated NATS WS domain regardless of API suggestion
     nats_ws_url = "wss://nats.inimatic.com"
     if hub_id_resp and hub_token and nats_user:
@@ -264,6 +313,13 @@ def dev_login(
             from adaos.services.capacity import _load_node_yaml as _load_node, _save_node_yaml as _save_node
 
             data_yaml = _load_node()
+            try:
+                if "cfg" in locals() and cfg:
+                    data_yaml.setdefault("node_id", cfg.node_id)
+                    data_yaml.setdefault("subnet_id", cfg.subnet_id)
+                    data_yaml.setdefault("role", cfg.role)
+            except Exception:
+                pass
             nats_cfg = data_yaml.get("nats") or {}
             nats_cfg["ws_url"] = nats_ws_url
             nats_cfg["user"] = nats_user
@@ -275,6 +331,42 @@ def dev_login(
             data_yaml["nats"] = nats_cfg
             _save_node(data_yaml)
             typer.echo("Saved NATS WS credentials to node.yaml")
+
+            # Ensure route rules exist so RouterService can route ui.notify to telegram.
+            try:
+                import yaml as _yaml
+                from pathlib import Path as _Path
+
+                base_dir = ctx.paths.base_dir()
+                rules_path = _Path(getattr(ctx.settings, "route_rules_path", "") or (base_dir / "route_rules.yaml"))
+                if not rules_path.is_absolute():
+                    rules_path = (base_dir / rules_path).resolve()
+                rules: dict = {}
+                if rules_path.exists():
+                    try:
+                        rules = _yaml.safe_load(rules_path.read_text(encoding="utf-8")) or {}
+                    except Exception:
+                        rules = {}
+                if not isinstance(rules, dict):
+                    rules = {}
+                if "rules" not in rules or not isinstance(rules.get("rules"), list):
+                    rules = {"version": 1, "rules": []}
+                items: list = list(rules.get("rules") or [])
+                have_tg = any(isinstance(r, dict) and ((r.get("target") or {}).get("io_type") == "telegram") for r in items)
+                have_stdout = any(isinstance(r, dict) and ((r.get("target") or {}).get("io_type") == "stdout") for r in items)
+                changed = False
+                if not have_tg:
+                    items.append({"match": {}, "target": {"node_id": "this", "kind": "io_type", "io_type": "telegram"}, "priority": 60})
+                    changed = True
+                if not have_stdout:
+                    items.append({"match": {}, "target": {"node_id": "this", "kind": "io_type", "io_type": "stdout"}, "priority": 50})
+                    changed = True
+                if changed:
+                    rules["rules"] = items
+                    rules_path.write_text(_yaml.safe_dump(rules, allow_unicode=True, sort_keys=False), encoding="utf-8")
+                    typer.echo(f"Updated route rules at {rules_path}")
+            except Exception as e:
+                _print_error(f"Failed to create route_rules.yaml: {e}")
         except Exception as e:
             _print_error(f"Failed to save NATS creds: {e}")
 
@@ -325,6 +417,23 @@ def skill_list(json_output: bool = typer.Option(False, "--json", help="Render ou
         _print_error(str(exc))
         raise typer.Exit(1)
     _echo_artifact_list(items, json_output)
+
+
+@skill_app.command("update")
+def skill_update(
+    name: str = typer.Argument(..., help="skill name in DEV space"),
+    json_output: bool = typer.Option(False, "--json", help="Render output as JSON."),
+) -> None:
+    service = _service()
+    try:
+        result = service.update_skill(name)
+    except ArtifactNotFoundError as exc:
+        _print_error(str(exc))
+        raise typer.Exit(exc.exit_code)
+    except RootServiceError as exc:
+        _print_error(str(exc))
+        raise typer.Exit(1)
+    _echo_update_result("Skill", result, json_output)
 
 
 @skill_app.command("delete")
@@ -453,6 +562,23 @@ def scenario_list(json_output: bool = typer.Option(False, "--json", help="Render
         _print_error(str(exc))
         raise typer.Exit(1)
     _echo_artifact_list(items, json_output)
+
+
+@scenario_app.command("update")
+def scenario_update(
+    name: str = typer.Argument(..., help="scenario name in DEV space"),
+    json_output: bool = typer.Option(False, "--json", help="Render output as JSON."),
+) -> None:
+    service = _service()
+    try:
+        result = service.update_scenario(name)
+    except ArtifactNotFoundError as exc:
+        _print_error(str(exc))
+        raise typer.Exit(exc.exit_code)
+    except RootServiceError as exc:
+        _print_error(str(exc))
+        raise typer.Exit(1)
+    _echo_update_result("Scenario", result, json_output)
 
 
 @scenario_app.command("delete")

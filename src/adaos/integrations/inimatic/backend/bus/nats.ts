@@ -1,4 +1,5 @@
-import { connect, StringCodec, consumerOpts, createInbox } from 'nats'
+import { connect, StringCodec } from 'nats'
+import { randomUUID } from 'crypto'
 
 let _nc: any = null
 const sc = StringCodec()
@@ -36,16 +37,43 @@ export async function natsConnect(): Promise<void> {
 export async function publishIn(hub_id: string, payload: any): Promise<void> {
   await natsConnect()
   const subj = `tg.input.${hub_id}`
-  await _nc.publish(subj, sc.encode(JSON.stringify(payload)))
+  let out = payload
+  // Backward compat: if callers pass a legacy payload, wrap into io.input envelope.
+  try {
+    const isEnv = out && typeof out === 'object' && typeof out.kind === 'string' && out.kind === 'io.input' && out.payload
+    if (!isEnv) {
+      const bot_id = String((payload && typeof payload === 'object' ? (payload as any).bot_id : '') || process.env['BOT_ID'] || 'main-bot')
+      const chat_id = String((payload && typeof payload === 'object' ? (payload as any).chat_id : '') || '')
+      const tg_msg_id = Number((payload && typeof payload === 'object' ? (payload as any).tg_msg_id : 0) || 0)
+      const text = String((payload && typeof payload === 'object' ? (payload as any).text : '') || '')
+      const route = (payload && typeof payload === 'object') ? (payload as any).route : undefined
+
+      out = {
+        event_id: randomUUID().replace(/-/g, ''),
+        kind: 'io.input',
+        ts: new Date().toISOString(),
+        dedup_key: `tg:${bot_id}:${chat_id}:${tg_msg_id}`,
+        payload: {
+          type: 'text',
+          source: 'telegram',
+          bot_id,
+          hub_id,
+          chat_id,
+          user_id: chat_id,
+          update_id: String(tg_msg_id),
+          payload: { text, meta: { msg_id: tg_msg_id } },
+          route,
+        },
+        meta: { bot_id, hub_id, trace_id: randomUUID().replace(/-/g, ''), retries: 0 },
+      }
+    }
+  } catch { /* best effort */ }
+  await _nc.publish(subj, sc.encode(JSON.stringify(out)))
 }
 
 export async function subscribeOut(handler: (payload: any) => Promise<void>): Promise<void> {
   await natsConnect()
-  const js = _nc.jetstream()
-  const opts = consumerOpts()
-  opts.deliverTo(createInbox())
-  opts.ackNone()
-  const sub = await js.subscribe('io.tg.out', opts)
+  const sub = _nc.subscribe('io.tg.out')
   ;(async () => {
     for await (const m of sub) {
       try { await handler(JSON.parse(sc.decode(m.data))) } catch { /* ignore */ }

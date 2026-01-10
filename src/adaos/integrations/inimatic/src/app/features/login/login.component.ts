@@ -3,54 +3,127 @@ import { LoginService, type LoginResult } from './login.service'
 import { IonButton, IonInput } from '@ionic/angular/standalone'
 import { FormsModule } from '@angular/forms'
 import { CommonModule } from '@angular/common'
+import { I18nService } from '../../runtime/i18n.service'
+import { TPipe } from '../../runtime/t.pipe'
+import { LanguagePickerComponent } from '../../shared/i18n/language-picker.component'
 
 @Component({
 	selector: 'app-login',
 	standalone: true,
 	templateUrl: './login.component.html',
 	styleUrl: './login.component.scss',
-	imports: [IonInput, IonButton, FormsModule, CommonModule],
+	imports: [IonInput, IonButton, FormsModule, CommonModule, TPipe, LanguagePickerComponent],
 })
 export class LoginComponent {
 	@Output() loginSuccess = new EventEmitter<LoginResult>()
 
-	deviceCode = ''
-	loading = false
-	errorMessage = ''
+	// Registration mode
+	userCode = ''
+	registrationLoading = false
+	registrationErrorKey = ''
+	registrationErrorParams: Record<string, any> | undefined
 
-	constructor(private loginService: LoginService) {}
+	// Login mode
+	loginLoading = false
+	loginErrorKey = ''
+	loginErrorParams: Record<string, any> | undefined
 
-	onLogin() {
-		this.errorMessage = ''
+	// Mode toggle
+	mode: 'selection' | 'registration' | 'login' = 'selection'
 
-		if (!this.deviceCode.trim()) {
-			this.errorMessage = 'Enter device code'
+	constructor(private loginService: LoginService, public i18n: I18nService) {}
+
+	switchToRegistration() {
+		this.mode = 'registration'
+		this.registrationErrorKey = ''
+		this.registrationErrorParams = undefined
+		this.userCode = ''
+	}
+
+	switchToLogin() {
+		this.mode = 'login'
+		this.loginErrorKey = ''
+		this.loginErrorParams = undefined
+	}
+
+	backToSelection() {
+		this.mode = 'selection'
+		this.registrationErrorKey = ''
+		this.registrationErrorParams = undefined
+		this.loginErrorKey = ''
+		this.loginErrorParams = undefined
+	}
+
+	onRegister() {
+		this.registrationErrorKey = ''
+		this.registrationErrorParams = undefined
+
+		if (!this.userCode.trim()) {
+			this.registrationErrorKey = 'login.error.enter_code'
 			return
 		}
 
-		this.loading = true
+		this.registrationLoading = true
 
-		this.loginService.login(this.deviceCode).subscribe({
+		this.loginService.register(this.userCode).subscribe({
 			next: (result) => {
-				this.loading = false
+				this.registrationLoading = false
 				this.loginSuccess.emit(result)
 			},
 			error: (err) => {
-				this.loading = false
+				this.registrationLoading = false
 
 				if (err instanceof Error && !('status' in err)) {
 					// Локальные ошибки (например, отсутствие поддержки WebAuthn)
-					this.errorMessage = err.message || 'WebAuthn error'
+					this.registrationErrorKey = 'login.error.webauthn'
+					this.registrationErrorParams = { msg: err.message || '' }
 					return
 				}
 
 				const status = err.status ?? 0
 				if (status === 400) {
-					this.errorMessage = 'Invalid login or WebAuthn registration required'
+					this.registrationErrorKey = 'login.error.invalid_code'
 				} else if (status >= 500) {
-					this.errorMessage = 'Server error'
+					this.registrationErrorKey = 'login.error.server'
 				} else {
-					this.errorMessage = 'Unexpected error'
+					this.registrationErrorKey = 'login.error.unexpected'
+				}
+			},
+		})
+	}
+
+	onLogin() {
+		this.loginErrorKey = ''
+		this.loginErrorParams = undefined
+		this.loginLoading = true
+
+		this.loginService.login().subscribe({
+			next: (result) => {
+				this.loginLoading = false
+				this.loginSuccess.emit(result)
+			},
+			error: (err) => {
+				this.loginLoading = false
+
+				if (err instanceof Error && !('status' in err)) {
+					// Локальные ошибки (например, отсутствие поддержки WebAuthn)
+					this.loginErrorKey = 'login.error.webauthn'
+					this.loginErrorParams = { msg: err.message || '' }
+					return
+				}
+
+				const status = err.status ?? 0
+				if (status === 400) {
+					const errorCode = err.error?.code || err.error?.error
+					if (errorCode === 'no_credentials_registered') {
+						this.loginErrorKey = 'login.error.no_credentials'
+					} else {
+						this.loginErrorKey = 'login.error.auth_failed'
+					}
+				} else if (status >= 500) {
+					this.loginErrorKey = 'login.error.server'
+				} else {
+					this.loginErrorKey = 'login.error.unexpected'
 				}
 			},
 		})

@@ -1,41 +1,126 @@
-<ion-content [style.--background]="app?.desktop?.background || '#0b0f14'">
-  <div class="desktop">
-    <div class="topbar">
-      <div class="left" *ngIf="app?.desktop?.topbar?.length">
-        <ion-button size="small" *ngFor="let b of app?.desktop?.topbar" (click)="onTopbarAction(b)">{{ b.label }}</ion-button>
-      </div>
-      <div class="webspace-controls">
-        <div class="label">Webspace: <strong>{{ webspaceLabel }}</strong></div>
-        <ion-select interface="popover" size="small" [value]="activeWebspace" (ionChange)="onWebspaceChanged($event)">
-          <ion-select-option *ngFor="let ws of webspaces" [value]="ws.id">{{ ws.title }} ({{ ws.id }})</ion-select-option>
-        </ion-select>
-        <div class="actions">
-          <ion-button size="small" fill="clear" (click)="createWebspace()">Создать</ion-button>
-          <ion-button size="small" fill="clear" (click)="renameWebspace()">Переименовать</ion-button>
-          <ion-button size="small" fill="clear" [disabled]="activeWebspace === 'default'" (click)="deleteWebspace()">Удалить</ion-button>
-          <ion-button size="small" fill="clear" (click)="refreshWebspaces()">Обновить</ion-button>
-        </div>
-      </div>
-      <div class="right">
-        <ion-button size="small" color="medium" (click)="resetDb()">Reset DB</ion-button>
-      </div>
-    </div>
+<!--src\adaos\integrations\inimatic\src\app\renderer\desktop\desktop.component.html-->
+<ion-content [style.--background]="app?.desktop?.background || 'var(--ion-background-color)'">
+	<div class="desktop-loading" *ngIf="isAuthenticated && !needsLogin && !needsPairing && !pendingApproveCode && !initError && !pageSchema">
+		<img
+			class="desktop-loading__logo"
+			src="assets/icons/adaos_logo_animated.svg"
+			alt="Loading"
+		/>
+	</div>
+	<div *ngIf="needsPairing" style="padding: 16px; max-width: 560px; margin: 0 auto; text-align: center;">
+		<h2 style="margin: 8px 0;">{{ 'pair.title' | t }}</h2>
+		<p style="opacity: 0.85; margin: 0 0 12px 0;">
+			{{ 'pair.instructions' | t }}
+		</p>
+		<qrcode [qrdata]="pairingUrl" [width]="240" [errorCorrectionLevel]="'M'" *ngIf="pairingUrl"></qrcode>
+		<p style="opacity: 0.7; margin: 12px 0 0 0; font-size: 12px; overflow-wrap: anywhere;">
+			{{ pairingId }}
+		</p>
+		<p *ngIf="pairStatusKey" style="opacity: 0.8; margin: 10px 0 0 0; font-size: 13px;">
+			{{ pairStatusKey | t:pairStatusParams }}
+		</p>
+		<div style="margin-top: 18px; text-align: left;">
+			<h3 style="margin: 0 0 8px 0;">{{ 'pair.owner_login_debug' | t }}</h3>
+			<app-login (loginSuccess)="onLoginSuccess()"></app-login>
+		</div>
+	</div>
+	<div *ngIf="pendingApproveCode && !needsPairing" style="padding: 16px; max-width: 560px; margin: 0 auto;">
+		<h2 style="margin: 8px 0;">{{ 'pair.approve.title' | t }}</h2>
+		<p style="opacity: 0.85; margin: 0 0 12px 0; overflow-wrap: anywhere;">
+			{{ 'pair.approve.code' | t }} <strong>{{ pendingApproveCode }}</strong>
+		</p>
+		<div *ngIf="!isAuthenticated" style="margin-top: 12px;">
+			<p style="opacity: 0.85; margin: 0 0 12px 0;">{{ 'pair.approve.login_prompt' | t }}</p>
+			<app-login (loginSuccess)="onLoginSuccess()"></app-login>
+		</div>
+		<div *ngIf="isAuthenticated">
+			<label style="display:block; font-size: 13px; opacity: 0.8; margin-bottom: 6px;">{{ 'pair.approve.webspace'
+				| t }}</label>
+			<select style="width: 100%; padding: 10px; border-radius: 10px;"
+				[value]="selectedApproveWebspace || activeWebspace"
+				(change)="selectedApproveWebspace = ($any($event.target).value)">
+				<option *ngFor="let ws of webspaces" [value]="ws.id">{{ ws.title || ws.id }}</option>
+				<option *ngIf="!webspaces.length" [value]="activeWebspace">{{ activeWebspace }}</option>
+			</select>
+			<div style="margin-top: 12px; display: flex; gap: 8px;">
+				<ion-button (click)="approvePairing()">{{ 'pair.approve.button' | t }}</ion-button>
+			</div>
+		</div>
+		<p *ngIf="pairStatusKey" style="opacity: 0.8; margin: 10px 0 0 0; font-size: 13px;">
+			{{ pairStatusKey | t:pairStatusParams }}
+		</p>
+	</div>
+	<div *ngIf="needsLogin" style="padding: 16px; max-width: 520px; margin: 0 auto;">
+		<h2 style="margin: 8px 0;">{{ 'pair.hub_offline.title' | t }}</h2>
+		<p style="opacity: 0.85; margin: 0 0 12px 0;">
+			{{ 'pair.hub_offline.desc' | t }}
+		</p>
+		<app-login (loginSuccess)="onLoginSuccess()"></app-login>
+	</div>
+	<div *ngIf="isAuthenticated && !needsLogin && !needsPairing && !pendingApproveCode && initError"
+		style="padding: 16px; max-width: 560px; margin: 0 auto; text-align: center;">
+		<h2 style="margin: 8px 0;">{{ 'desktop.load_error.title' | t }}</h2>
+		<p style="opacity: 0.85; margin: 0 0 12px 0; overflow-wrap: anywhere;">
+			{{ initError }}
+		</p>
+		<div style="display:flex; justify-content:center; gap: 10px; flex-wrap: wrap;">
+			<ion-button (click)="retryInit()">{{ 'desktop.load_error.retry' | t }}</ion-button>
+			<ion-button fill="outline" (click)="logout()">{{ 'desktop.load_error.logout' | t }}</ion-button>
+		</div>
+	</div>
+	<div class="desktop" *ngIf="pageSchema as page">
+		<div class="mobile-panelbar" *ngIf="hasRole('sidebar')">
+			<ion-button class="mobile-menu-btn" fill="clear" size="small" (click)="toggleSidebar()"
+				[attr.aria-label]="sidebarOpen ? ('desktop.menu.close' | t) : ('desktop.menu.open' | t)">
+				<ion-icon slot="start" [name]="sidebarOpen ? 'close-outline' : 'menu-outline'"></ion-icon>
+				<ion-label>{{ sidebarOpen ? ('desktop.menu.close' | t) : ('desktop.menu.open' | t) }}</ion-label>
+			</ion-button>
+			<div class="spacer"></div>
+		</div>
+		<div class="drawer-backdrop" *ngIf="sidebarOpen" (click)="closeSidebar()"></div>
 
-    <div class="icons">
-      <button class="icon" *ngFor="let ic of resolvedIcons" (click)="onIconClick(ic)">
-        <ion-badge *ngIf="ic.dev" color="warning" class="dev-badge">DEV</ion-badge>
-        <ion-icon [name]="ic.icon"></ion-icon>
-        <span>{{ ic.title }}</span>
-      </button>
-    </div>
+		<ion-fab class="desktop-fab" vertical="bottom" horizontal="end">
+			<ion-fab-button (click)="onFabAction({id: 'home'})">
+				<ion-icon name="home-outline"></ion-icon>
+			</ion-fab-button>
+			<ion-fab-list side="top">
+				<ion-fab-button (click)="onFabAction({id: 'menu'})" *ngIf="hasRole('sidebar')">
+					<ion-icon name="menu-outline"></ion-icon>
+				</ion-fab-button>
+				<ion-fab-button *ngFor="let a of fabActions" (click)="onFabAction(a)">
+					<ion-icon [name]="a.icon || 'ellipsis-horizontal-outline'"></ion-icon>
+				</ion-fab-button>
+			</ion-fab-list>
+		</ion-fab>
 
-    <div class="widgets">
-      <ng-container *ngFor="let w of resolvedWidgets">
-        <div class="widget-wrapper">
-          <ion-badge *ngIf="w.dev" color="warning" class="dev-badge">DEV</ion-badge>
-          <ada-widget [type]="w.type" [cfg]="{ title: w.title, data: getData(w.source) }"></ada-widget>
-        </div>
-      </ng-container>
-    </div>
-  </div>
+		<div class="desktop-grid" [ngClass]="desktopLayoutClass(page)"
+			[class.is-compact]="isCompact" [class.sidebar-open]="sidebarOpen">
+			<ng-container *ngFor="let area of page.layout.areas">
+				<ng-container>
+					<div class="area" [ngClass]="['area-' + area.id, area.role ? 'area-role-' + area.role : '']"
+						[class.is-empty]="!areaHasWidgets(area.id)">
+						<ng-container *ngFor="let w of getWidgetsInArea(area.id)">
+							<ng-container
+								*ngIf="isCompact && area.role === 'aux' && widgetIsCollapsible(w); else plainWidget">
+								<div class="widget-collapsible">
+									<div class="widget-collapsible__header" (click)="toggleWidgetCollapsed(w)">
+										<div class="widget-collapsible__title">{{ w.title || ('desktop.panel' | t) }}
+										</div>
+										<ion-icon
+											[name]="widgetIsCollapsed(w) ? 'chevron-down-outline' : 'chevron-up-outline'"></ion-icon>
+									</div>
+									<div class="widget-collapsible__body" [class.is-collapsed]="widgetIsCollapsed(w)">
+										<ada-page-widget-host [widget]="w"></ada-page-widget-host>
+									</div>
+								</div>
+							</ng-container>
+							<ng-template #plainWidget>
+								<ada-page-widget-host [widget]="w"></ada-page-widget-host>
+							</ng-template>
+						</ng-container>
+					</div>
+				</ng-container>
+			</ng-container>
+		</div>
+	</div>
 </ion-content>

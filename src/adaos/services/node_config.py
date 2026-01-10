@@ -69,11 +69,15 @@ class NodeSettings:
 class DevSettings:
     # Store relative path under base_dir; resolve via _expand_path
     workspace: str = "dev"
+    forge_repo: str | None = None
+    forge_path: str | None = None
 
 
 @dataclass
 class NodeConfig:
+    # TODO refactor to node.id
     node_id: str
+    # TODO refactor to subnet.id
     subnet_id: str
     role: str
     hub_url: str | None = None
@@ -110,7 +114,7 @@ class NodeConfig:
             self.role = "hub"
             changed = True
         if not self.token:
-            self.token = os.environ.get("ADAOS_TOKEN", "dev-root-token")
+            self.token = os.environ.get("ADAOS_TOKEN", "dev-local-token")
             changed = True
         if not self.node_id:
             self.node_id = str(uuid.uuid4())
@@ -269,6 +273,10 @@ def _settings_to_dict(settings: Any) -> dict[str, Any]:
             data["hub"] = hub
     if isinstance(settings, DevSettings):
         data["workspace"] = _stringify_path(data.get("workspace"))
+        forge_repo = data.get("forge_repo")
+        data["forge_repo"] = forge_repo if forge_repo else None
+        forge_path = data.get("forge_path")
+        data["forge_path"] = str(forge_path) if forge_path else None
     return data
 
 
@@ -296,7 +304,9 @@ def _settings_from_dict(settings_cls: type, payload: Any):
         return NodeSettings(id=payload.get("id") if isinstance(payload, dict) else None)
     if settings_cls is DevSettings:
         workspace = payload.get("workspace") if isinstance(payload, dict) else None
-        return DevSettings(workspace=workspace or "dev")
+        forge_repo = payload.get("forge_repo") if isinstance(payload, dict) else None
+        forge_path = payload.get("forge_path") if isinstance(payload, dict) else None
+        return DevSettings(workspace=workspace or "dev", forge_repo=forge_repo, forge_path=forge_path)
     raise TypeError(f"Unsupported settings class: {settings_cls!r}")
 
 
@@ -414,9 +424,31 @@ def load_node(ctx: AgentContext | None = None) -> NodeConfig:
 
 def save_node(conf: NodeConfig, *, ctx: AgentContext | None = None) -> None:
     conf.sync_sections()
+    path = _config_path(ctx)
     data = conf.to_dict()
-    _config_path(ctx).write_text(
-        yaml.safe_dump(data, allow_unicode=True, sort_keys=False),
+
+    def _deep_merge(existing: Any, overlay: Any) -> Any:
+        if not isinstance(existing, dict) or not isinstance(overlay, dict):
+            return overlay
+        merged: dict[str, Any] = dict(existing)
+        for key, value in overlay.items():
+            if key in merged and isinstance(merged.get(key), dict) and isinstance(value, dict):
+                merged[key] = _deep_merge(merged.get(key), value)
+            else:
+                merged[key] = value
+        return merged
+
+    try:
+        existing_raw = yaml.safe_load(path.read_text(encoding="utf-8")) if path.exists() else {}
+    except Exception:
+        existing_raw = {}
+    if not isinstance(existing_raw, dict):
+        existing_raw = {}
+
+    # Preserve unknown top-level sections (e.g. capacity) when rewriting node.yaml.
+    merged = _deep_merge(existing_raw, data)
+    path.write_text(
+        yaml.safe_dump(merged, allow_unicode=True, sort_keys=False),
         encoding="utf-8",
     )
 

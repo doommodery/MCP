@@ -8,7 +8,7 @@ from typing import Iterator, AsyncIterator, Awaitable, Optional, TypeVar, Callab
 
 import y_py as Y
 
-from adaos.apps.yjs.y_store import get_ystore_for_webspace
+from adaos.services.yjs.store import get_ystore_for_webspace
 
 T = TypeVar("T")
 _log = logging.getLogger("adaos.yjs.doc")
@@ -32,7 +32,7 @@ def _resolve_live_room(webspace_id: str):
     server is running in-process. Import is lazy to avoid circular deps.
     """
     try:
-        from adaos.apps.yjs.y_gateway import y_server  # pylint: disable=import-outside-toplevel
+        from adaos.services.yjs.gateway import y_server  # pylint: disable=import-outside-toplevel
     except Exception:
         return None
     return y_server.rooms.get(webspace_id)
@@ -104,7 +104,8 @@ def get_ydoc(webspace_id: str) -> Iterator[Y.YDoc]:
         await ystore.start()
         try:
             await ystore.apply_updates(ydoc)
-        except Exception:
+        except BaseException:
+            # Treat corrupted updates as "no state"; start from empty doc.
             pass
         try:
             return Y.encode_state_vector(ydoc)
@@ -140,14 +141,15 @@ async def async_get_ydoc(webspace_id: str) -> AsyncIterator[Y.YDoc]:
     """
     Async counterpart of :func:`get_ydoc` for use inside running event loops.
     """
-    _log.debug("async_get_ydoc enter webspace=%s", webspace_id)
+    # Debug log omitted to reduce noise in dev logs.
     ystore = get_ystore_for_webspace(webspace_id)
     ydoc = Y.YDoc()
     await ystore.start()
     try:
         try:
             await ystore.apply_updates(ydoc)
-        except Exception:
+        except BaseException:
+            # Treat corrupted updates as "no state"; start from empty doc.
             pass
         try:
             before = Y.encode_state_vector(ydoc)

@@ -12,7 +12,8 @@ import { startRegistration, startAuthentication } from '@simplewebauthn/browser'
 export interface LoginResult {
 	sessionJwt: string
 	browserKeyId: string
-	sid: string
+	sid?: string
+	ownerId?: string
 }
 
 interface VerifyDeviceCodeResponse {
@@ -37,6 +38,7 @@ interface LoginChallengeResponse {
 interface LoginFinishResponse {
 	session_jwt: string
 	browser_key_id: string
+	owner_id?: string
 }
 
 @Injectable({
@@ -45,6 +47,7 @@ interface LoginFinishResponse {
 export class LoginService {
 	private readonly sidKey = 'adaos_web_sid'
 	private readonly sessionKey = 'adaos_web_session_jwt'
+	private readonly hubIdKey = 'adaos_hub_id'
 	private sid: string | null = null
 	private sessionJwt: string | null = null
 
@@ -54,14 +57,26 @@ export class LoginService {
 	}
 
 	/**
-	 * Выполнить полный цикл логина по device code + WebAuthn.
+	 * Выполнить полный цикл логина по user code + WebAuthn (регистрация).
 	 *
 	 * 1) /v1/owner/login/verify — связываем sid и owner.
-	 * 2) Пытаемся WebAuthn login.
-	 * 3) Если нужна регистрация — выполняем WebAuthn регистрацию и после неё логин.
+	 * 2) Регистрируем WebAuthn credential.
+	 * 3) Автоматически логинимся через зарегистрированный credential.
 	 */
-	login(deviceCode: string): Observable<LoginResult> {
-		return from(this.loginInternal(deviceCode)).pipe(
+	register(userCode: string): Observable<LoginResult> {
+		return from(this.registerInternal(userCode)).pipe(
+			catchError((error: HttpErrorResponse) => {
+				return throwError(() => error)
+			})
+		)
+	}
+
+	/**
+	 * Выполнить логин по WebAuthn без каких-либо параметров.
+	 * Браузер автоматически выберет подходящий credential из сохраненных.
+	 */
+	login(): Observable<LoginResult> {
+		return from(this.loginInternal()).pipe(
 			catchError((error: HttpErrorResponse) => {
 				return throwError(() => error)
 			})
@@ -78,22 +93,23 @@ export class LoginService {
 
 	// ----------------- Внутренняя логика -----------------
 
-	private async loginInternal(deviceCode: string): Promise<LoginResult> {
+	private async registerInternal(userCode: string): Promise<LoginResult> {
 		const sid = this.ensureSid()
 
 		// 1. Связываем sid с owner через введённый код
-		await this.verifyDeviceCode(deviceCode, sid)
+		await this.verifyUserCode(userCode, sid)
 
-		// 2. Пытаемся выполнить WebAuthn login; если потребуется регистрация — сделаем её и повторим
-		try {
-			return await this.performWebAuthnLogin(sid)
-		} catch (error: any) {
-			if (this.isRegistrationRequiredError(error)) {
-				await this.performWebAuthnRegistration(sid)
-				return await this.performWebAuthnLogin(sid)
-			}
-			throw error
-		}
+		// 2. Выполняем WebAuthn регистрацию
+		await this.performWebAuthnRegistration(sid)
+
+		// 3. Выполняем WebAuthn логин сразу после регистрации
+		return await this.performWebAuthnLoginWithSid(sid)
+	}
+
+	private async loginInternal(): Promise<LoginResult> {
+		// Запрашиваем challenge без указания owner_id
+		// Backend вернет пустой список allowCredentials, браузер выберет автоматически
+		return await this.performWebAuthnLoginAuto()
 	}
 
 	/**
@@ -129,10 +145,62 @@ export class LoginService {
 	private restoreSessionJwt(): string | null {
 		try {
 			const stored = localStorage.getItem(this.sessionKey)
-			return stored && stored.trim() ? stored.trim() : null
+			const tok = stored && stored.trim() ? stored.trim() : null
+			// Root-proxy now expects signed JWTs; legacy opaque `sess_*` can't be validated statelessly.
+			if (tok && !tok.includes('.')) {
+				try {
+					localStorage.removeItem(this.sessionKey)
+				} catch {}
+				return null
+			}
+			// Drop expired/invalid JWTs early to avoid noisy WS failures.
+			if (tok) {
+				const payload = this.decodeJwtPayload(tok)
+				const exp = typeof payload?.exp === 'number' ? payload.exp : undefined
+				if (!exp) {
+					try {
+						localStorage.removeItem(this.sessionKey)
+					} catch {}
+					return null
+				}
+				const now = Math.floor(Date.now() / 1000)
+				// small skew/leeway
+				if (exp <= now + 15) {
+					try {
+						localStorage.removeItem(this.sessionKey)
+					} catch {}
+					return null
+				}
+				// Ensure hub id is persisted even if backend response omits it.
+				try {
+					const hubId = this.pickHubIdFromJwtPayload(payload)
+					if (hubId) localStorage.setItem(this.hubIdKey, hubId)
+				} catch {}
+			}
+			return tok
 		} catch {
 			return null
 		}
+	}
+
+	private decodeJwtPayload(token: string): any | null {
+		try {
+			const parts = token.split('.')
+			if (parts.length < 2) return null
+			const b64 = parts[1].replace(/-/g, '+').replace(/_/g, '/')
+			// pad
+			const padded = b64 + '='.repeat((4 - (b64.length % 4)) % 4)
+			const json = atob(padded)
+			return JSON.parse(json)
+		} catch {
+			return null
+		}
+	}
+
+	private pickHubIdFromJwtPayload(payload: any): string | null {
+		if (!payload || typeof payload !== 'object') return null
+		const hubId = payload.hub_id || payload.subnet_id || payload.owner_id
+		return typeof hubId === 'string' && hubId.trim() ? hubId.trim() : null
 	}
 
 	private randomSidFallback(): string {
@@ -141,16 +209,13 @@ export class LoginService {
 			.slice(2)}_${Date.now().toString(16)}`
 	}
 
-	private async verifyDeviceCode(
-		deviceCode: string,
-		sid: string
-	): Promise<void> {
+	private async verifyUserCode(userCode: string, sid: string): Promise<void> {
 		await firstValueFrom(
 			this.root.post<VerifyDeviceCodeResponse>(
 				'/v1/owner1/login/verify',
 				{
 					sid,
-					device_code: deviceCode,
+					user_code: userCode,
 				}
 			)
 		)
@@ -188,12 +253,13 @@ export class LoginService {
 		this.ensureWebAuthnSupported()
 
 		// 1) запрос challenge для логина
-		const { publicKeyCredentialRequestOptions } = await firstValueFrom(
-			this.root.post<LoginChallengeResponse>(
-				'/v1/owner1/webauthn/login/challenge',
-				{ sid }
+		const { publicKeyCredentialRequestOptions, challenge } =
+			await firstValueFrom(
+				this.root.post<LoginChallengeResponse & { challenge?: string }>(
+					'/v1/owner1/webauthn/login/challenge',
+					{ sid }
+				)
 			)
-		)
 
 		// 2) локальная аутентификация
 		const assertion = await startAuthentication(
@@ -207,6 +273,9 @@ export class LoginService {
 				{
 					sid,
 					credential: assertion,
+					challenge:
+						challenge ||
+						publicKeyCredentialRequestOptions.challenge,
 				}
 			)
 		)
@@ -217,11 +286,116 @@ export class LoginService {
 		} catch {
 			// ignore storage errors
 		}
+		try {
+			// Prefer hub_id/subnet_id inside JWT (owner_id is not always a hub id).
+			const payload = this.decodeJwtPayload(finish.session_jwt)
+			const hubId = this.pickHubIdFromJwtPayload(payload) || finish.owner_id || null
+			if (hubId) localStorage.setItem(this.hubIdKey, hubId)
+		} catch {}
 
 		return {
 			sessionJwt: finish.session_jwt,
 			browserKeyId: finish.browser_key_id,
 			sid,
+			ownerId: finish.owner_id,
+		}
+	}
+
+	private async performWebAuthnLoginWithSid(
+		sid: string
+	): Promise<LoginResult> {
+		this.ensureWebAuthnSupported()
+
+		// 1) запрос challenge для логина
+		const challengeResponse = await firstValueFrom(
+			this.root.post<LoginChallengeResponse & { challenge?: string }>(
+				'/v1/owner1/webauthn/login/challenge',
+				{ sid }
+			)
+		)
+
+		// 2) локальная аутентификация
+		const assertion = await startAuthentication(
+			challengeResponse.publicKeyCredentialRequestOptions
+		)
+
+		// 3) отправка assertion на backend
+		const finish = await firstValueFrom(
+			this.root.post<LoginFinishResponse>(
+				'/v1/owner1/webauthn/login/finish',
+				{
+					sid,
+					credential: assertion,
+					challenge:
+						challengeResponse.challenge ||
+						challengeResponse.publicKeyCredentialRequestOptions
+							.challenge,
+				}
+			)
+		)
+
+		this.sessionJwt = finish.session_jwt
+		try {
+			localStorage.setItem(this.sessionKey, finish.session_jwt)
+		} catch {
+			// ignore storage errors
+		}
+		try {
+			if (finish.owner_id) localStorage.setItem(this.hubIdKey, finish.owner_id)
+		} catch {}
+
+		return {
+			sessionJwt: finish.session_jwt,
+			browserKeyId: finish.browser_key_id,
+			sid,
+			ownerId: finish.owner_id,
+		}
+	}
+
+	private async performWebAuthnLoginAuto(): Promise<LoginResult> {
+		this.ensureWebAuthnSupported()
+
+		// 1) запрос challenge без owner_id - браузер сам выберет credential
+		const challengeResponse = await firstValueFrom(
+			this.root.post<LoginChallengeResponse & { challenge?: string }>(
+				'/v1/owner1/webauthn/login/challenge-by-owner',
+				{}
+			)
+		)
+
+		// 2) локальная аутентификация - браузер выберет подходящий credential
+		const assertion = await startAuthentication(
+			challengeResponse.publicKeyCredentialRequestOptions
+		)
+
+		// 3) отправка assertion на backend без sid
+		const finish = await firstValueFrom(
+			this.root.post<LoginFinishResponse>(
+				'/v1/owner1/webauthn/login/finish',
+				{
+					credential: assertion,
+					challenge:
+						challengeResponse.challenge ||
+						challengeResponse.publicKeyCredentialRequestOptions
+							.challenge,
+				}
+			)
+		)
+
+		this.sessionJwt = finish.session_jwt
+		try {
+			localStorage.setItem(this.sessionKey, finish.session_jwt)
+		} catch {
+			// ignore storage errors
+		}
+		try {
+			if (finish.owner_id) localStorage.setItem(this.hubIdKey, finish.owner_id)
+		} catch {}
+
+		return {
+			sessionJwt: finish.session_jwt,
+			browserKeyId: finish.browser_key_id,
+			ownerId: finish.owner_id,
 		}
 	}
 
@@ -232,21 +406,5 @@ export class LoginService {
 		if (!('PublicKeyCredential' in window)) {
 			throw new Error('This browser does not support WebAuthn')
 		}
-	}
-
-	/**
-	 * Проверка: ошибка от /webauthn/login/challenge, означающая, что браузеру нужно сначала зарегистрировать ключ.
-	 */
-	private isRegistrationRequiredError(error: unknown): boolean {
-		if (!(error instanceof HttpErrorResponse)) return false
-		if (error.status !== 400) return false
-		const payload = error.error as any
-		const code =
-			typeof payload?.code === 'string'
-				? payload.code
-				: typeof payload?.error === 'string'
-				? payload.error
-				: ''
-		return code === 'registration_required'
 	}
 }

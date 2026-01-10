@@ -33,7 +33,8 @@ from adaos.services.crypto.secrets_service import SecretsService
 from adaos.services.skill.secrets_backend import SkillSecretsBackend
 from adaos.services.skill.resolver import SkillPathResolver
 from adaos.services.capacity import install_skill_in_capacity, uninstall_skill_from_capacity
-from adaos.apps.yjs.webspace import default_webspace_id
+from adaos.services.yjs.webspace import default_webspace_id
+import ast
 
 _name_re = re.compile(r"^[a-zA-Z0-9_\-\/]+$")
 
@@ -106,6 +107,7 @@ class SkillManager:
         validate: bool = True,
         strict: bool = True,
         probe_tools: bool = False,
+        safe: bool = False,
     ) -> tuple[SkillMeta, Optional[object]]:
         """
         Возвращает (meta, report|None). При strict и ошибках валидации можно выбрасывать исключение.
@@ -121,7 +123,11 @@ class SkillManager:
         test_mode = os.getenv("ADAOS_TESTING") == "1"
         if test_mode:
             return f"installed: {name} (registry-only{' test-mode' if test_mode else ''})"
-        # 3) mono-only установка через репозиторий (sparse-add + pull)
+        # 3) при безопасной установке проверяем, что рабочее дерево чисто под skills/*
+        root = self.ctx.paths.workspace_dir()
+        if safe and (root / ".git").exists():
+            ensure_clean(self.ctx.git, str(root), ["skills"])
+        # 4) mono-only установка через репозиторий (sparse-add + pull)
         meta = self.ctx.skills_repo.install(name, branch=None)
         """ if not validate:
             return meta, None """
@@ -213,6 +219,375 @@ class SkillManager:
         interpreter: Path | None = None
         python_paths: list[str] = []
         skill_source = skill_dir
+
+    # ------------------------------------------------------------------
+    # Runtime update helpers (workspace/dev, used by DEBUG flows and LLM-assisted workflows)
+    # ------------------------------------------------------------------
+
+    def runtime_update(
+        self,
+        name: str,
+        *,
+        space: str = "workspace",
+    ) -> Dict[str, Any]:
+        """
+        Synchronise an existing runtime slot with latest sources and tool
+        declarations from the corresponding workspace or DEV skill folder.
+
+        This is intentionally lightweight: it does not change versions,
+        slots or install dependencies – it only propagates changed source
+        files and extends ``resolved.manifest.json`` with tools defined in
+        ``skill.yaml`` that are missing from the active slot manifest.
+        """
+        ctx = self.ctx
+        space_normalized = (space or "workspace").strip().lower()
+        if space_normalized not in ("workspace", "dev"):
+            raise ValueError("space must be 'workspace' or 'dev'")
+
+        # Resolve skill directory and runtime environment depending on space.
+        if space_normalized == "dev":
+            root = ctx.paths.dev_skills_dir()
+            root = root() if callable(root) else root
+            skill_dir = Path(root) / name
+            status = self.dev_runtime_status(name)
+            env = self._runtime_env_dev(name)
+        else:
+            root = ctx.paths.skills_workspace_dir()
+            root = root() if callable(root) else root
+            skill_dir = Path(root) / name
+            status = self.runtime_status(name)
+            env = self._runtime_env(name)
+
+        if not skill_dir.exists():
+            return {"ok": False, "reason": "skill_dir_missing", "skill": name, "space": space_normalized}
+
+        version = status.get("version")
+        active_slot = status.get("active_slot")
+        resolved_manifest = status.get("resolved_manifest")
+        if not version or not resolved_manifest:
+            return {"ok": False, "reason": "no_active_runtime", "skill": name, "space": space_normalized}
+
+        try:
+            current_link = env.ensure_current_link(version)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "reason": "ensure_current_failed",
+                "skill": name,
+                "space": space_normalized,
+                "error": str(exc),
+            }
+
+        runtime_skill_root = current_link / "src" / "skills" / name
+        if not runtime_skill_root.exists():
+            return {
+                "ok": False,
+                "reason": "runtime_src_missing",
+                "skill": name,
+                "space": space_normalized,
+                "path": str(runtime_skill_root),
+            }
+
+        # 1) Sync source files (py/json/yaml/md) from workspace/DEV into runtime slot.
+        changed_files = self._runtime_sync_sources(skill_dir, runtime_skill_root)
+
+        # 2) Sync tool declarations into resolved.manifest.json from skill.yaml.
+        manifest_path = Path(resolved_manifest)
+        tools_added: list[str] = []
+        if manifest_path.exists():
+            try:
+                tools_added = self._runtime_sync_manifest_tools(name, manifest_path, skill_dir)
+            except Exception as exc:
+                # Do not treat manifest sync as fatal for runtime_update; report in payload.
+                return {
+                    "ok": False,
+                    "reason": "manifest_sync_failed",
+                    "skill": name,
+                    "space": space_normalized,
+                    "error": str(exc),
+                }
+
+        payload = {
+            "ok": True,
+            "skill": name,
+            "space": space_normalized,
+            "version": version,
+            "slot": active_slot,
+            "files": changed_files,
+            "tools_added": tools_added,
+        }
+
+        # Keep local node capacity in sync so UI layers (e.g. web desktop)
+        # can discover skills/apps from node.yaml even when only runtime_update
+        # is used (e.g. `adaos setup update`).
+        try:
+            install_skill_in_capacity(name, str(version), active=True, dev=(space_normalized == "dev"))
+            try:
+                from adaos.services.node_config import load_config
+                from adaos.services.capacity import get_local_capacity
+                from adaos.services.registry.subnet_directory import get_directory
+
+                conf = load_config()
+                if conf.role == "hub":
+                    cap = get_local_capacity()
+                    get_directory().repo.replace_skill_capacity(conf.node_id, cap.get("skills") or [])
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        try:
+            emit(
+                self.bus,
+                "dev.skill.runtime.updated",
+                payload,
+                actor="skill.manager",
+            )
+        except Exception:
+            # Best-effort: event emission must not break update.
+            pass
+
+        return payload
+
+    def _runtime_sync_sources(self, source_root: Path, runtime_root: Path) -> list[str]:
+        """
+        Copy changed source files from ``source_root`` into ``runtime_root``.
+
+        Only *.py, *.json, *.yml, *.yaml, *.md are considered; auxiliary
+        folders such as .git, __pycache__, .runtime are skipped.
+        """
+        exts = {".py", ".json", ".yml", ".yaml", ".md"}
+        changed: list[str] = []
+        if not source_root.exists() or not runtime_root.exists():
+            return changed
+
+        skip_dirs = {".git", "__pycache__", ".runtime"}
+
+        for src in source_root.rglob("*"):
+            if not src.is_file():
+                continue
+            if src.suffix.lower() not in exts:
+                continue
+            if any(part in skip_dirs for part in src.parts):
+                continue
+            rel = src.relative_to(source_root)
+            dst = runtime_root / rel
+            try:
+                if dst.exists():
+                    src_mtime = src.stat().st_mtime
+                    dst_mtime = dst.stat().st_mtime
+                    if src_mtime <= dst_mtime:
+                        continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(src, dst)
+                changed.append(rel.as_posix())
+            except OSError:
+                continue
+        return changed
+
+    def _runtime_sync_manifest_tools(
+        self,
+        name: str,
+        manifest_path: Path,
+        skill_dir: Path,
+    ) -> list[str]:
+        """
+        Extend the active slot manifest's ``tools`` section with any tools
+        defined in ``skill.yaml`` that are not yet present.
+        """
+        if not manifest_path.exists():
+            return []
+
+        data = json.loads(manifest_path.read_text(encoding="utf-8"))
+        tools = data.get("tools") or {}
+        if not isinstance(tools, dict):
+            tools = {}
+        policy = data.get("policy") or {}
+        default_timeout = float(policy.get("timeout_seconds") or 30.0)
+        default_retries = int(policy.get("retry_count") or 1)
+
+        # Use the first existing tool (if any) as template for permissions/secrets.
+        template = next(iter(tools.values()), None)
+        base_permissions = template.get("permissions") if isinstance(template, dict) else None
+        base_secrets = template.get("secrets") if isinstance(template, dict) else []
+
+        skill_yaml = skill_dir / "skill.yaml"
+        if not skill_yaml.exists():
+            return []
+        manifest = yaml.safe_load(skill_yaml.read_text(encoding="utf-8")) or {}
+        skill_tools = manifest.get("tools") or []
+        if not isinstance(skill_tools, list):
+            return []
+
+        added: list[str] = []
+        for entry in skill_tools:
+            if not isinstance(entry, dict):
+                continue
+            tool_name = entry.get("name")
+            if not tool_name or tool_name in tools:
+                continue
+            raw_entry = entry.get("entry") or ""
+            if ":" not in raw_entry:
+                continue
+            module, attr = raw_entry.split(":", 1)
+            input_schema = entry.get("input_schema") or {}
+            output_schema = entry.get("output_schema") or {}
+            tools[tool_name] = {
+                "name": tool_name,
+                "module": module,
+                "callable": attr,
+                "timeout_seconds": default_timeout,
+                "retries": default_retries,
+                "schema": {
+                    "input": input_schema,
+                    "output": output_schema,
+                },
+                "permissions": base_permissions,
+                "secrets": base_secrets,
+            }
+            added.append(tool_name)
+
+        if added:
+            data["tools"] = tools
+            tmp = manifest_path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, manifest_path)
+
+        return added
+
+    # ------------------------------------------------------------------
+    # Workspace helpers for dev/runtime sync
+    # ------------------------------------------------------------------
+    def sync_skill_yaml_tools_from_handlers(self, name: str, *, space: str = "workspace") -> dict[str, Any]:
+        """
+        Ensure that ``skill.yaml.tools`` contains entries for all ``@tool``
+        decorators defined in the skill handlers.
+
+        This is a best-effort helper used during DEBUG runtime sync to keep
+        manifests and runtime slots aligned while iterating on workspace
+        skills. It only appends missing tools with generic schemas and never
+        removes or rewrites existing entries.
+        """
+        space_normalized = (space or "workspace").strip().lower()
+        if space_normalized not in ("workspace", "dev"):
+            raise ValueError("space must be 'workspace' or 'dev'")
+
+        ctx = self.ctx
+        if space_normalized == "dev":
+            root = ctx.paths.dev_skills_dir()
+        else:
+            root = ctx.paths.skills_workspace_dir()
+        root = root() if callable(root) else root
+        skill_dir = Path(root) / name
+        skill_yaml = skill_dir / "skill.yaml"
+        handlers_main = skill_dir / "handlers" / "main.py"
+        if not handlers_main.exists():
+            return {"ok": False, "reason": "handlers_missing", "skill": name, "space": space_normalized}
+        try:
+            source = handlers_main.read_text(encoding="utf-8")
+        except OSError as exc:
+            return {
+                "ok": False,
+                "reason": "read_handlers_failed",
+                "skill": name,
+                "space": space_normalized,
+                "error": str(exc),
+            }
+
+        try:
+            tree = ast.parse(source, filename=str(handlers_main))
+        except SyntaxError as exc:
+            return {
+                "ok": False,
+                "reason": "parse_failed",
+                "skill": name,
+                "space": space_normalized,
+                "error": str(exc),
+            }
+
+        discovered: list[tuple[str, str]] = []
+
+        for node in tree.body:
+            if not isinstance(node, ast.FunctionDef):
+                continue
+            func_name = node.name
+            for dec in node.decorator_list:
+                # Match @tool("name") or @tool(name="...").
+                tool_name: str | None = None
+                if isinstance(dec, ast.Call):
+                    target = dec.func
+                    is_tool = False
+                    if isinstance(target, ast.Name) and target.id == "tool":
+                        is_tool = True
+                    elif isinstance(target, ast.Attribute) and target.attr == "tool":
+                        is_tool = True
+                    if not is_tool:
+                        continue
+                    if dec.args:
+                        arg = dec.args[0]
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            tool_name = arg.value
+                    if not tool_name:
+                        for kw in dec.keywords or []:
+                            if kw.arg == "name" and isinstance(kw.value, ast.Constant) and isinstance(kw.value.value, str):
+                                tool_name = kw.value.value
+                                break
+                elif isinstance(dec, ast.Name) and dec.id == "tool":
+                    tool_name = func_name
+                if tool_name:
+                    discovered.append((tool_name, func_name))
+
+        if not discovered:
+            return {"ok": True, "skill": name, "space": space_normalized, "tools_added": []}
+
+        manifest: dict[str, Any] = {}
+        if skill_yaml.exists():
+            try:
+                raw = yaml.safe_load(skill_yaml.read_text(encoding="utf-8")) or {}
+                if isinstance(raw, dict):
+                    manifest = raw
+            except Exception:
+                manifest = {}
+
+        tools = manifest.get("tools") or []
+        if not isinstance(tools, list):
+            tools = []
+        existing = {entry.get("name") for entry in tools if isinstance(entry, dict)}
+
+        added_entries: list[dict[str, Any]] = []
+        for tool_name, func_name in discovered:
+            if tool_name in existing:
+                continue
+            entry = {
+                "name": tool_name,
+                "description": f"Auto-generated from handlers.main:{func_name}",
+                "entry": f"handlers.main:{func_name}",
+                "input_schema": {"type": "object", "properties": {}},
+                "output_schema": {"type": "object", "properties": {}},
+            }
+            tools.append(entry)
+            existing.add(tool_name)
+            added_entries.append(entry)
+
+        if added_entries:
+            manifest["tools"] = tools
+            try:
+                skill_yaml.write_text(yaml.safe_dump(manifest, sort_keys=False, allow_unicode=True), encoding="utf-8")
+            except Exception:
+                return {
+                    "ok": False,
+                    "reason": "write_skill_yaml_failed",
+                    "skill": name,
+                    "space": space_normalized,
+                    "tools_added": [e["name"] for e in added_entries],
+                }
+
+        return {
+            "ok": True,
+            "skill": name,
+            "space": space_normalized,
+            "tools_added": [e["name"] for e in added_entries],
+        }
         skill_env_path: Path | None = None
         log_path: Path
 
@@ -288,7 +663,7 @@ class SkillManager:
                 results[test_name] = replace(result, detail=detail)
         return results
 
-    def uninstall(self, name: str) -> None:
+    def uninstall(self, name: str, *, safe: bool = False) -> None:
         self.caps.require("core", "skills.manage", "net.git")
         name = name.strip()
         if not _name_re.match(name):
@@ -306,11 +681,15 @@ class SkillManager:
             return f"uninstalled: {name} (registry-only{suffix})"
         names = [r.name for r in self.reg.list()]
         prefixed = [f"skills/{n}" for n in names]
-        ensure_clean(self.ctx.git, str(root), prefixed)
+        if safe:
+            # Безопасный режим: проверяем отсутствие незакоммиченных изменений под управляемыми путями.
+            ensure_clean(self.ctx.git, str(root), prefixed)
         self.ctx.git.sparse_init(str(root), cone=False)
         if prefixed:
             self.ctx.git.sparse_set(str(root), prefixed, no_cone=True)
-        self.ctx.git.pull(str(root))
+        if safe:
+            # В безопасном режиме обновляем workspace, чтобы поддерево навыков соответствовало удалённому репо.
+            self.ctx.git.pull(str(root))
         remove_error: Exception | None = None
         try:
             remove_tree(
@@ -1658,4 +2037,3 @@ class SkillManager:
             dev_mode=True,
             extra_env=extra_env,
         )
-

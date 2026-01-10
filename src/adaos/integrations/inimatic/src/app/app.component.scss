@@ -1,3 +1,94 @@
 .android_header {
 	padding-top: 24px;
+	background: var(--ion-background-color);
+}
+
+ion-header ion-toolbar {
+	--background: var(--ion-background-color);
+}
+
+.app-title {
+	display: inline-flex;
+	align-items: center;
+	gap: 10px;
+}
+
+.wordmark-btn {
+	--padding-start: 0;
+	--padding-end: 0;
+	--padding-top: 0;
+	--padding-bottom: 0;
+	--color: currentColor;
+	margin: 0;
+	height: auto;
+	text-transform: none;
+}
+
+.wordmark-btn::part(native) {
+	font: inherit;
+}
+
+.build-id {
+	font-size: 11px;
+	letter-spacing: 0.02em;
+	opacity: 0.55;
+	text-transform: uppercase;
+}
+
+.hub-status {
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	font-size: 12px;
+	letter-spacing: 0.02em;
+	opacity: 0.85;
+	text-transform: uppercase;
+}
+
+.hub-status .dot {
+	width: 9px;
+	height: 9px;
+	border-radius: 999px;
+	background: var(--ion-color-medium);
+	box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.04);
+}
+
+.hub-status .dot[data-status='online'] {
+	background: var(--ion-color-success);
+}
+
+.hub-status .dot[data-status='offline'] {
+	background: var(--ion-color-danger);
+}
+
+@media (max-width: 900px) {
+	.hub-status .label {
+		display: none;
+	}
+	.app-title {
+		gap: 8px;
+	}
+}
+
+.logout-btn {
+	margin-inline-start: 2px;
+	--padding-start: 6px;
+	--padding-end: 6px;
+	--color: currentColor;
+	opacity: 0.9;
+}
+
+.unauth-logo {
+	width: 26px;
+	height: 26px;
+	object-fit: contain;
+	margin-inline-start: 8px;
+	opacity: 0.95;
+}
+
+/* Global header sits above routed pages; offset page content accordingly. */
+ion-router-outlet ion-content {
+	/* Ionic sets `--offset-top` inline (often to 0px) when there is no per-page ion-header.
+	   Use `!important` to ensure routed content does not render under the global header. */
+	--offset-top: var(--ada-app-header-height, 56px) !important;
 }

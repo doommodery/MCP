@@ -105,75 +105,21 @@ if ($LASTEXITCODE -ne 0) { Write-Host "pip upgrade failed." -ForegroundColor Red
 .\.venv\Scripts\python.exe -m pip install -e .[dev]
 if ($LASTEXITCODE -ne 0) { Write-Host "pip install -e . failed." -ForegroundColor Red; exit 1 }
 
-# Frontend deps
-Push-Location $subPath
-Write-Host "Installing frontend deps..."
-
-$used = ""
-if (Get-Command pnpm -ErrorAction SilentlyContinue) {
-    pnpm install
-    if ($LASTEXITCODE -ne 0) {
-        Pop-Location
-        Write-Host "pnpm install failed." -ForegroundColor Red
-        exit 1
-    }
-    $used = "pnpm install"
-}
-else {
-    if (Test-Path "package-lock.json") {
-        npm ci
-        if ($LASTEXITCODE -ne 0) {
-            Write-Host "npm ci failed; falling back to npm install." -ForegroundColor Yellow
-            npm install
-            if ($LASTEXITCODE -ne 0) {
-                Pop-Location
-                Write-Host "npm install failed." -ForegroundColor Red
-                exit 1
-            }
-            $used = "npm install"
-        }
-        else {
-            $used = "npm ci"
-        }
-    }
-    else {
-        npm install
-        if ($LASTEXITCODE -ne 0) {
-            Pop-Location
-            Write-Host "npm install failed." -ForegroundColor Red
-            exit 1
-        }
-        $used = "npm install"
-    }
-}
-Pop-Location
-Write-Host ("Frontend deps installed ({0})." -f $used) -ForegroundColor Green
-
 # .env from example
 if (!(Test-Path ".env") -and (Test-Path ".env.example")) {
     Copy-Item .env.example .env
 }
 
 # Default webspace content (scenarios + skills)
-$defaultScenarios = @("web_desktop")
-$defaultSkills = @("weather_skill")
+# Keep logic inside `adaos install` so presets stay consistent across platforms.
 $adaosBase = Join-Path $PWD ".adaos"
 New-Item -ItemType Directory -Force -Path $adaosBase | Out-Null
 $env:ADAOS_BASE_DIR = $adaosBase
 
-foreach ($scenario in $defaultScenarios) {
-    Write-Host "Installing scenario $scenario..."
-    & .\.venv\Scripts\adaos.exe scenario install $scenario
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Scenario '$scenario' install failed (maybe already installed)."
-    }
-}
-foreach ($skill in $defaultSkills) {
-    Write-Host "Installing skill $skill..."
-    & .\.venv\Scripts\adaos.exe skill install $skill
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Skill '$skill' install failed (maybe already installed)."
-    }
+Write-Host "Installing default webspace content (adaos install)..."
+& .\.venv\Scripts\adaos.exe install
+if ($LASTEXITCODE -ne 0) {
+    Write-Warning "adaos install failed (check output above)."
 }
 
 $helpText = @'
@@ -188,6 +134,7 @@ Next steps (in separate terminals):
      adaos api serve --host 127.0.0.1 --port 8777 --reload
   4) Backend (Inimatic):
      cd src\adaos\integrations\inimatic
+     npm i
      npm run start:api-dev
   5) Frontend (Inimatic):
      cd src\adaos\integrations\inimatic

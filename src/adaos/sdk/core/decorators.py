@@ -7,6 +7,7 @@ from adaos.sdk.data.bus import on, emit
 from adaos.sdk.data.context import set_current_skill, clear_current_skill
 from adaos.sdk.core._ctx import require_ctx
 from adaos.sdk.core.errors import SdkRuntimeNotInitialized
+from adaos.sdk.io.context import io_meta
 
 # публичные реестры (стабильные имена)
 subscriptions: List[Tuple[str, Callable]] = []
@@ -56,9 +57,14 @@ async def register_subscriptions():
 
         if inspect.iscoroutinefunction(fn):
 
-            async def _wrap(evt, _fn=fn, _skill=skill_name):
+            async def _wrap(evt, _fn=fn, _skill=skill_name, _topic=topic):
                 pushed = _maybe_push_skill(_fn, _skill)
                 try:
+                    payload = getattr(evt, "payload", None) if hasattr(evt, "payload") else None
+                    meta = payload.get("_meta") if isinstance(payload, dict) else None
+                    if isinstance(meta, dict):
+                        with io_meta(meta):
+                            return await _fn(evt)
                     return await _fn(evt)
                 finally:
                     if pushed:
@@ -66,15 +72,25 @@ async def register_subscriptions():
 
         else:
 
-            async def _wrap(evt, _fn=fn, _skill=skill_name):
+            async def _wrap(evt, _fn=fn, _skill=skill_name, _topic=topic):
                 pushed = _maybe_push_skill(_fn, _skill)
                 try:
-                    _fn(evt)
+                    payload = getattr(evt, "payload", None) if hasattr(evt, "payload") else None
+                    meta = payload.get("_meta") if isinstance(payload, dict) else None
+                    if isinstance(meta, dict):
+                        with io_meta(meta):
+                            _fn(evt)
+                    else:
+                        _fn(evt)
                 finally:
                     if pushed:
                         clear_current_skill()
 
+        # Attach debug metadata so the core event bus can log slow handlers
         handler_name = f"{fn.__module__}.{fn.__name__}"
+        setattr(_wrap, "_adaos_skill", skill_name or "<unknown>")
+        setattr(_wrap, "_adaos_topic", topic)
+        setattr(_wrap, "_adaos_handler", handler_name)
         skill_key = skill_name or "<unknown>"
         skill_summaries.setdefault(skill_key, []).append((topic, fn.__name__))
         await on(topic, _wrap)

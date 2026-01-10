@@ -1,41 +1,62 @@
 <ion-app>
-	<ion-tabs>
-		<ion-header [translucent]="true" [class]="isAndroid? 'android_header' : ''">
+	<ion-header [translucent]="false" [class]="isAndroid? 'android_header' : ''">
 			<ion-toolbar>
-				<ion-title>
-					INIMATIC
-				</ion-title>
-			</ion-toolbar>
-		</ion-header>
-		<ion-tab-bar slot="bottom">
-			<ion-tab-button tab="private">
-				<ion-icon name="lock-closed-outline"></ion-icon>
-				Private point
-			</ion-tab-button>
-			<ion-tab-button tab="public">
-				<ion-icon name="people"></ion-icon>
-				Public point
-			</ion-tab-button>
-			<ion-tab-button tab="follower">
-				<ion-icon name="phone-portrait"></ion-icon>
-				My phone
-			</ion-tab-button>
-			<ion-tab-button tab="hub">
-				<ion-icon name="apps"></ion-icon>
-				hub
-			</ion-tab-button>
-			<ion-tab-button tab="member">
-				<ion-icon name="laptop"></ion-icon>
-				member
-			</ion-tab-button>
-			<ion-tab-button tab="desktop">
-				<ion-icon name="desktop"></ion-icon>
-				Desktop
-			</ion-tab-button>
-			<ion-tab-button tab="settings">
-				<ion-icon name="settings"></ion-icon>
-				Settings
-			</ion-tab-button>
-		</ion-tab-bar>
-	</ion-tabs>
+			<ion-buttons slot="start">
+				<ng-container *ngIf="isAuthenticated; else unauthLogo">
+					<ng-container *ngIf="isNarrow && sidebarAvailable; else wideHome">
+						<ion-button (click)="toggleSidebar()">
+							<ion-icon name="menu-outline"></ion-icon>
+						</ion-button>
+					</ng-container>
+					<ng-template #wideHome>
+						<ion-button (click)="onClickHome()">
+							<ion-icon name="home-outline"></ion-icon>
+						</ion-button>
+					</ng-template>
+				</ng-container>
+				<ng-template #unauthLogo>
+					<img class="unauth-logo" [src]="logoSrc" alt="Inimatic" />
+				</ng-template>
+			</ion-buttons>
+			<ion-title>
+				<div class="app-title">
+					<ng-container *ngIf="isAuthenticated; else wordmarkPlain">
+						<ion-button
+							class="wordmark-btn"
+							fill="clear"
+							size="small"
+							(click)="onClickHome()"
+							aria-label="Home"
+						>
+							<span class="wordmark">INIMATIC</span>
+						</ion-button>
+					</ng-container>
+					<ng-template #wordmarkPlain>
+						<span class="wordmark">INIMATIC</span>
+					</ng-template>
+					<span class="build-id" *ngIf="buildId">{{ buildId }}</span>
+					<span class="hub-status" *ngIf="hubStatus$ | async as hub">
+						<span class="dot" [attr.data-status]="hub" aria-hidden="true"></span>
+						<span class="label">{{ ('status.' + hub) | t }}</span>
+					</span>
+					<ion-button
+						*ngIf="isAuthenticated"
+						class="logout-btn"
+						fill="clear"
+						size="small"
+						(click)="onClickLogout()"
+						[attr.aria-label]="'aria.logout_debug' | t"
+					>
+						<ion-icon name="log-out-outline"></ion-icon>
+					</ion-button>
+				</div>
+			</ion-title>
+				<ion-buttons slot="end">
+				<ion-button *ngIf="isAuthenticated" (click)="onClickYjsReload()" [attr.aria-label]="'aria.reload' | t">
+					<ion-icon name="refresh-outline"></ion-icon>
+				</ion-button>
+			</ion-buttons>
+		</ion-toolbar>
+	</ion-header>
+	<ion-router-outlet></ion-router-outlet>
 </ion-app>

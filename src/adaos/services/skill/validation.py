@@ -8,10 +8,12 @@ from typing import Any, Dict, List, Optional
 import copy
 import yaml
 from jsonschema import Draft202012Validator, ValidationError
+import importlib.resources as ir
 
 from adaos.services.agent_context import AgentContext, get_ctx
 
 SCHEMA_PATH = Path(__file__).with_name("skill_schema.json")
+WEBUI_SCHEMA_RES = ("adaos.abi", "webui.v1.schema.json")
 
 
 @dataclass
@@ -30,6 +32,15 @@ class ValidationReport:
 
 def _load_schema() -> Dict[str, Any]:
     return json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+
+
+def _load_webui_schema() -> Dict[str, Any]:
+    try:
+        res = ir.files(WEBUI_SCHEMA_RES[0]) / WEBUI_SCHEMA_RES[1]
+        with ir.as_file(res) as fp:
+            return json.loads(Path(fp).read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise RuntimeError(f"failed to load WebUI schema: {exc}")
 
 
 def _read_yaml(path: Path) -> Dict[str, Any]:
@@ -57,6 +68,8 @@ def _normalize_spec(spec: Dict[str, Any]) -> Dict[str, Any]:
         s["events"]["subscribe"] = []
     if not isinstance(s["events"].get("publish"), list):
         s["events"]["publish"] = []
+    if not isinstance(s.get("data_projections"), list):
+        s["data_projections"] = []
     return s
 
 
@@ -101,6 +114,20 @@ def _static_checks(skill_dir: Path, install_mode: bool) -> List[Issue]:
         for i, v in enumerate(arr):
             if not isinstance(v, str) or not v.strip():
                 issues.append(Issue("error", f"events.{key}.invalid", f"events.{key}[{i}] must be non-empty string", f"events.{key}[{i}]"))
+
+    # webui.json (optional): validate declarative WebUI contributions.
+    webui = skill_dir / "webui.json"
+    if webui.exists():
+        try:
+            raw = json.loads(webui.read_text(encoding="utf-8-sig") or "{}")
+            if not isinstance(raw, dict):
+                issues.append(Issue("error", "webui.invalid_type", "webui.json must be a JSON object", "webui.json"))
+            else:
+                Draft202012Validator(_load_webui_schema()).validate(raw)
+        except ValidationError as e:
+            issues.append(Issue("error", "webui.schema.invalid", f"webui.json schema violation: {e.message}", "webui.json"))
+        except Exception as e:
+            issues.append(Issue("error", "webui.read.failed", f"failed to read/parse webui.json: {e}", "webui.json"))
     return issues
 
 
@@ -134,8 +161,9 @@ except Exception:
     except Exception:
         mod_tools, subs = {{}}, []
 
+required_dp = getattr(module, 'REQUIRES_DATA_PROJECTIONS', None)
 exports = list(mod_tools.keys())
-print(json.dumps({{"ok": True, "tools": exports, "subs": subs}}))
+print(json.dumps({{"ok": True, "tools": exports, "subs": subs, "requires_data_projections": required_dp}}))
 """
     proc = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
     issues: List[Issue] = []
@@ -163,6 +191,21 @@ print(json.dumps({{"ok": True, "tools": exports, "subs": subs}}))
     for topic in declared_subs:
         if topic not in exported_subs:
             issues.append(Issue("error", "events.missing_sub", f"no @subscribe handler for '{topic}'", "events.subscribe[]"))
+
+    # If handlers/main.py explicitly declares that it requires data_projections
+    # but the manifest does not provide them, surface a validation issue so
+    # skill authors/LLM programmers can fix the manifest.
+    required_dp = payload.get("requires_data_projections")
+    manifest_dp = data.get("data_projections") or []
+    if required_dp and not manifest_dp:
+        issues.append(
+            Issue(
+                "warning" if not install_mode else "error",
+                "data_projections.missing",
+                "handlers/main.py declares REQUIRES_DATA_PROJECTIONS but skill.yaml has no data_projections section",
+                "data_projections",
+            )
+        )
 
     # probe_tools оставим на будущее (без исполнения)
     return issues

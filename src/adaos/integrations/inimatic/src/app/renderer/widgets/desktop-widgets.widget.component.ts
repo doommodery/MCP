@@ -1,0 +1,117 @@
+import { Component, Input, OnDestroy, OnInit } from '@angular/core'
+import { CommonModule } from '@angular/common'
+import { IonicModule } from '@ionic/angular'
+import { WidgetConfig, WidgetType } from '../../runtime/page-schema.model'
+import { PageDataService } from '../../runtime/page-data.service'
+import { Subscription } from 'rxjs'
+import { MetricTileWidgetComponent } from './metric-tile.widget.component'
+import { CommandBarWidgetComponent } from './command-bar.widget.component'
+
+@Component({
+  selector: 'ada-desktop-widgets',
+  standalone: true,
+  imports: [CommonModule, IonicModule, MetricTileWidgetComponent, CommandBarWidgetComponent],
+  template: `
+    <div class="widgets-section">
+      <h2 *ngIf="widget?.title">{{ widget.title }}</h2>
+      <ng-container *ngIf="widgets.length; else emptyState">
+        <div class="widgets-grid">
+          <div class="widget-wrapper" *ngFor="let w of widgets">
+            <ion-badge *ngIf="w.inputs?.['dev']" color="warning" class="dev-badge">DEV</ion-badge>
+            <ng-container [ngSwitch]="w.type">
+              <ada-metric-tile-widget
+                *ngSwitchCase="'visual.metricTile'"
+                [widget]="w"
+              ></ada-metric-tile-widget>
+              <ada-command-bar-widget
+                *ngSwitchCase="'input.commandBar'"
+                [widget]="w"
+              ></ada-command-bar-widget>
+              <ada-metric-tile-widget
+                *ngSwitchDefault
+                [widget]="w"
+              ></ada-metric-tile-widget>
+            </ng-container>
+          </div>
+        </div>
+      </ng-container>
+      <ng-template #emptyState>
+        <div class="empty-hint">No widgets installed</div>
+      </ng-template>
+    </div>
+  `,
+  styles: [
+    `
+      .widgets-section {
+        padding: 8px 0;
+      }
+      .widgets-section h2 {
+        font-size: 14px;
+        font-weight: 500;
+        margin: 0 0 8px;
+        text-transform: uppercase;
+      }
+      .widgets-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+        gap: 12px;
+        align-items: start;
+      }
+      .widget-wrapper {
+        position: relative;
+        min-width: 0;
+      }
+      .dev-badge {
+        position: absolute;
+        top: 4px;
+        right: 4px;
+        z-index: 1;
+      }
+      .empty-hint {
+        color: var(--ion-color-medium);
+        font-size: 14px;
+      }
+    `,
+  ],
+})
+export class DesktopWidgetsWidgetComponent implements OnInit, OnDestroy {
+  @Input() widget!: WidgetConfig
+
+  widgets: Array<WidgetConfig> = []
+
+  private dataSub?: Subscription
+
+  constructor(private data: PageDataService) {}
+
+  ngOnInit(): void {
+    const stream = this.data.load<any[]>(this.widget?.dataSource)
+    if (stream) {
+      this.dataSub = stream.subscribe((items) => {
+        const raw = Array.isArray(items) ? items : []
+        this.widgets = raw.map((it) => {
+          const cfg: any = { ...(it && typeof it === 'object' ? it : {}) }
+          cfg.id = String(cfg.id || '')
+          cfg.type = String(cfg.type || 'visual.metricTile') as WidgetType
+          cfg.area = this.widget.area
+          if (!cfg.inputs || typeof cfg.inputs !== 'object') cfg.inputs = {}
+          cfg.inputs = { ...cfg.inputs, dev: !!cfg.dev }
+          // Only treat `source` as a Yjs path when it actually looks like one.
+          // `source` can also be provenance (e.g. "skill:voice_chat_skill").
+          const source = typeof cfg.source === 'string' ? String(cfg.source) : ''
+          const looksLikeYPath = source.startsWith('y:') || source.startsWith('data/')
+          if (!cfg.dataSource && looksLikeYPath) {
+            cfg.dataSource = {
+              kind: 'y',
+              path: source.startsWith('y:') ? source.slice(2) : source,
+            }
+          }
+          return cfg as WidgetConfig
+        })
+      })
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.dataSub?.unsubscribe()
+  }
+}

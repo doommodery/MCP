@@ -11,10 +11,15 @@ import { routes } from './app/app.routes'
 import { AppComponent } from './app/app.component'
 import { environment } from './environments/environment'
 import { provideServiceWorker } from '@angular/service-worker'
+import { registerIcons } from './app/icons'
+import { initDebugConsole } from './app/debug-log'
 
 if (environment.production) {
 	enableProdMode()
 }
+
+registerIcons()
+initDebugConsole()
 
 bootstrapApplication(AppComponent, {
 	providers: [

@@ -5,6 +5,7 @@ This document describes how AdaOS routes outgoing UI notifications (IO routing) 
 ## IO Routing (stdout)
 
 - Source: Any skill can emit `ui.notify` events. The local RouterService subscribes to `ui.notify` on the process-local `LocalEventBus`.
+- Source (TTS): RouterService also listens to `ui.say` events with payload `{ text, voice? }` and routes them to the target node’s `/api/say`.
 - Rules: RouterService reads `.adaos/route_rules.yaml` and picks the first rule by `priority` (descending). Minimal schema is supported:
 
 ```
@@ -27,6 +28,27 @@ rules:
 - Delivery:
   - `this`: prints locally using `io_console.print_text` → `[IO/console@{node}] ...`.
   - Other node: Router resolves `base_url` for the target node and POSTs to `<base_url>/api/io/console/print`.
+
+## Web IO Routing (Yjs webspaces)
+
+For browser-driven webspaces we use dedicated “web IO” topics that the RouterService projects into the appropriate Yjs doc.
+
+- Source:
+  - `io.out.chat.append` (chat message append)
+  - `io.out.say` (enqueue TTS)
+- Target selection:
+  - default: RouterService resolves the destination from `_meta.webspace_id` (fallback: `payload.webspace_id`, else `default`)
+  - broadcast: set `_meta.webspace_ids = [...]` to fan-out into multiple webspaces
+  - route table: set `_meta.route_id = '<id>'` and configure `data.routing.routes[<id>]` in the source webspace
+- Projection:
+  - `io.out.chat.append` -> `data.voice_chat.messages`
+  - `io.out.say` -> `data.tts.queue`
+
+### Routeless skills
+
+When a tool is invoked with a payload that contains `_meta`, AdaOS sets an execution
+context so `io.out.*` helpers inherit it automatically. This allows skills to emit
+outputs without carrying routing logic (no explicit `_meta` plumbing in skill code).
 
 ## Subnet Directory (hub and members)
 
